@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Search as SearchIcon, Filter, Download, ChevronLeft, ChevronRight, X, Settings } from 'lucide-react';
 
-const API_BASE_URL = import.meta.env.VITE_APP_API_BASE ?? 'http://localhost:8000';
-console.log(API_BASE_URL);
+const API_BASE_URL = import.meta.env.VITE_APP_API_BASE
 
 // Must match ALL_COLUMNS from server/main.py (excluding 'id' for display/selector)
 const ALL_COLUMNS = [
@@ -344,7 +343,7 @@ const Database = () => {
           >
             <button
               type="submit"
-              className="px-4 py-2 bg-gray-300 rounded-lg hover:bg-blue-700 focus:ring-2 focus:ring-blue-500"
+              className="px-4 py-2 bg-gray-300 rounded-lg hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 dark:text-gray-800"
             >
               Apply filters
             </button>

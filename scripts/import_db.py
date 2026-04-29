@@ -19,8 +19,9 @@ except ImportError:
 # Configuration
 load_dotenv()
 
-# DATABASE_URL = os.getenv("DATABASE_URL")
-DATABASE_URL = "postgresql://molly@localhost:5432/cyted_prod"
+DATABASE_URL = os.getenv("DATABASE_URL")
+assert DATABASE_URL is not None, "please set environment variable DATABASE_URL"
+
 CHUNK_SIZE = 10000  # Process 10k rows at a time
 FIELDS = ['cytokine_name', 'cell_type', 'cytokine_effect', 'regulated_genes',
        'gene_response_type', 'regulated_pathways', 'pathway_response_type',
