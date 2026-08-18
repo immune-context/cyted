@@ -1,9 +1,3 @@
-# Cytokine Effects Knowledge Base
-Webpage: https://mpark20.github.io/cytokine-effects-kb/
-
-Paper: In progress...
-
-
 ## Internal Setup Instructions
 ### Database setup
 Run these commands to convert the CSV outputs to a PostgreSQL database (named "cytokines" by default).
