@@ -34,3 +34,4 @@ client/dist
 __pycache__/
 data/
 raw_data/
+scripts/data.ipynb
