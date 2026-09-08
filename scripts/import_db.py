@@ -1,369 +1,1183 @@
+
+"""
+Build/populate the cytokine interaction PostgreSQL database from a raw parquet file.
+
+Assumptions
+-----------
+1. PostgreSQL database exists, and tables already created using create_tables.sql
+2. The database URL is supplied via the DATABASE_URL environment variable, e.g.
+       postgresql+psycopg://postgres:password@localhost:5432/cytokine_db
+3. The parquet contains the raw dataframe columns shown in the example.
+
+Run
+---
+    export DATABASE_URL='postgresql://molly@localhost:5432/cyted_dev'
+    python build_database.py cyted.parquet
+
+Optional:
+    python build_database.py cyted.parquet --batch-size 50000
+"""
+
 import argparse
-import pandas as pd
+import json
 import os
+import re
 import sys
-import pyarrow.parquet as pq
+
+import pandas as pd
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import OperationalError
-from tqdm import tqdm
+from sqlalchemy.engine import Connection, Engine
 from dotenv import load_dotenv
-from urllib.parse import urlparse, urlunparse
 
-try:
-    import psycopg2
-    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
-    PSYCOPG2_AVAILABLE = True
-except ImportError:
-    PSYCOPG2_AVAILABLE = False
-
-# Configuration
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-assert DATABASE_URL is not None, "please set environment variable DATABASE_URL"
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-CHUNK_SIZE = 10000  # Process 10k rows at a time
-FIELDS = ['cytokine_name', 'cell_type', 'cytokine_effect', 'regulated_genes',
-       'gene_response_type', 'regulated_pathways', 'pathway_response_type',
-       'cell_process_category', 'regulated_cell_processes',
-       'cell_process_response_type', 'chunk_id', 'source_id', 'key_sentences',
-       'causality_description', 'citation_id_classification',
-       'mapped_citation_id', 'species', 'experimental_system_type',
-       'experimental_system_details', 'experimental_perturbation',
-       'experimental_readout', 'experimental_time_point',
-       'experimental_concentration', 'qc_basic_interaction', 'qc_cell_type',
-       'regulated_genes_human', 'regulated_genes_mouse', 'causality_type',
-       'necessary_condition', 'additional_info', 'cytokine_name_original',
-       'cell_type_original', 'cytokine_effect_original',
-       'regulated_pathways_orig', 'experimental_readout_original',
-       'experimental_perturbation_original', 'url']
+REQUIRED_COLUMNS = [
+    "cytokine_name",
+    "cell_type",
+    "cytokine_effect",
+    "regulated_genes",
+    "gene_response_type",
+    "regulated_pathways",
+    "pathway_response_type",
+    "cell_process_category",
+    "regulated_cell_processes",
+    "cell_process_response_type",
+    "chunk_id",
+    "source_id",
+    "key_sentences",
+    "causality_description",
+    "citation_id_classification",
+    "mapped_citation_id",
+    "species",
+    "experimental_system_type",
+    "experimental_system_details",
+    "experimental_perturbation",
+    "experimental_readout",
+    "experimental_time_point",
+    "experimental_concentration",
+    "qc_basic_interaction",
+    "qc_cell_type",
+    "regulated_genes_human",
+    "regulated_genes_mouse",
+    "causality_type",
+    "necessary_condition",
+    "additional_info",
+    "cytokine_name_original",
+    "cell_type_original",
+    "cytokine_effect_original",
+    "regulated_pathways_original",
+    "experimental_readout_original",
+    "experimental_perturbation_original",
+    "url",
+]
 
-def prepare_chunk(chunk, explode=True, col_name="cytokine_name"):
-    """Normalize a dataframe chunk for DB insert"""
-    chunk = chunk.where(pd.notnull(chunk), None)
+# Columns stored in interactions. raw_row_id is deliberately retained so that
+# every database interaction can be traced to exactly one raw parquet row.
+INTERACTION_COLUMNS = [
+    "raw_row_id",
+    "cytokine_id",
+    "cell_type_id",
+    "chunk_id",
+    "cytokine_effect",
+    "gene_response_type",
+    "pathway_response_type",
+    "cell_process_response_type",
+    "causality_description",
+    "causality_type",
+    "necessary_condition",
+    "species",
+    "experimental_system_type",
+    "experimental_system_details",
+    "experimental_perturbation",
+    "experimental_readout",
+    "experimental_time_point",
+    "experimental_concentration",
+    "citation_id_classification",
+    "mapped_citation_id",
+    "key_sentences",
+    "qc_basic_interaction",
+    "qc_cell_type",
+    "additional_info",
+    "cytokine_name_original",
+    "cell_type_original",
+    "cytokine_effect_original",
+    "regulated_pathways_original",
+    "experimental_readout_original",
+    "experimental_perturbation_original",
+]
 
-    def normalize(x):
-        if pd.isna(x) or x is None:
-            return []
-        if isinstance(x, str):
-            return x.split(";") if explode else x
-        if isinstance(x, list):
-            return x if explode else ";".join(x)
-        return [x]
-
-    chunk[col_name] = chunk[col_name].apply(normalize)
-    if explode:
-        chunk = chunk.explode(col_name).reset_index(drop=True)
-    if not "url" in chunk.columns:
-        chunk["url"] = chunk["chunk_id"].apply(lambda x: f"https://pmc.ncbi.nlm.nih.gov/articles/{x.split('_')[0]}")
-    return chunk[FIELDS] if len(chunk) else chunk
-
-
-def ensure_database_exists(database_url):
-    """Create the database if it doesn't exist"""
-    try:
-        # Parse the database URL
-        parsed = urlparse(database_url)
-        db_name = parsed.path.lstrip('/')
-        
-        if not db_name:
-            print("⚠ Warning: No database name found in DATABASE_URL")
-            return database_url
-        
-        # Create a connection URL to the default 'postgres' database
-        default_db_url = urlunparse((
-            parsed.scheme,
-            parsed.netloc,
-            '/postgres',  # Connect to default postgres database
-            parsed.params,
-            parsed.query,
-            parsed.fragment
-        ))
-        
-        # Try to connect to the target database first
-        try:
-            test_engine = create_engine(database_url)
-            with test_engine.connect() as conn:
-                conn.execute(text("SELECT 1"))
-            print(f"✓ Database '{db_name}' already exists")
-            return database_url
-        except OperationalError as e:
-            # Check if the error is specifically about database not existing
-            error_msg = str(e).lower()
-            if 'does not exist' in error_msg or 'database' in error_msg and 'not exist' in error_msg:
-                # Database doesn't exist, create it
-                print(f"Database '{db_name}' does not exist. Creating it...")
-            else:
-                # Some other connection error - re-raise it
-                raise
-            
-            # Connect to default postgres database to create the new database
-            if not PSYCOPG2_AVAILABLE:
-                print(f"⚠ Warning: psycopg2 not available. Cannot auto-create database.")
-                print(f"  Please create the database manually:")
-                print(f"  createdb {db_name}")
-                return database_url
-            
-            # Parse connection details for psycopg2
-            parsed_default = urlparse(default_db_url)
-            conn_params = {
-                'host': parsed_default.hostname,
-                'port': parsed_default.port or 5432,
-                'user': parsed_default.username,
-                'password': parsed_default.password,
-                'database': 'postgres'
-            }
-            
-            # Remove None values
-            conn_params = {k: v for k, v in conn_params.items() if v is not None}
-            
-            try:
-                conn = psycopg2.connect(**conn_params)
-                conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-                cursor = conn.cursor()
-                
-                # Check if database exists
-                cursor.execute(
-                    "SELECT 1 FROM pg_database WHERE datname = %s",
-                    (db_name,)
-                )
-                if cursor.fetchone():
-                    print(f"✓ Database '{db_name}' already exists")
-                else:
-                    # Create the database
-                    # Escape the database name (psycopg2 will handle quoting)
-                    cursor.execute(f'CREATE DATABASE "{db_name}"')
-                    print(f"✓ Created database '{db_name}'")
-                
-                cursor.close()
-                conn.close()
-            except Exception as e:
-                print(f"⚠ Warning: Could not create database: {e}")
-                print(f"  You may need to create the database manually:")
-                print(f"  createdb {db_name}")
-                # Continue anyway - the connection attempt will show the actual error
-            return database_url
-            
-    except Exception as e:
-        print(f"⚠ Warning: Could not ensure database exists: {e}")
-        print("  Attempting to continue with existing connection...")
-        return database_url
-
-# SQL types for each field (fields not listed default to TEXT)
-FIELD_SQL_TYPES = {}
+# PostgreSQL tables are cleared in child-to-parent order.
+TABLES_TO_CLEAR = [
+    "interaction_cell_processes",
+    "interaction_pathways",
+    "interaction_genes",
+    "interactions",
+    "source_chunks",
+    "sources",
+    "cell_processes",
+    "pathways",
+    "genes",
+    "cell_types",
+    "cytokines",
+]
 
 
-def create_tables(engine):
-    """Create the interactions table with proper schema"""
-    print("Creating database tables...")
+# ---------------------------------------------------------------------------
+# Cleaning / normalization
+# ---------------------------------------------------------------------------
 
-    # Build column definitions from FIELDS so schema stays in sync
-    columns = ["        id BIGSERIAL PRIMARY KEY"]
-    for field in FIELDS:
-        sql_type = FIELD_SQL_TYPES.get(field, "TEXT")
-        columns.append(f"        {field} {sql_type}")
-    columns_sql = ",\n".join(columns)
+def split_semicolon(value) -> list[str]:
+    """Split semicolon-delimited extracted values into clean strings."""
+    value = clean_value(value)
 
-    create_table_sql = f"""
-    CREATE TABLE IF NOT EXISTS public.cytokine_effects (
-{columns_sql}
-    );
-    """
-    
-    with engine.connect() as conn:
-        conn.execute(text(create_table_sql))
-        conn.commit()
-    
-    print("✓ Tables created successfully")
+    if value is None:
+        return []
 
-def create_indexes(engine):
-    """Create indexes on frequently queried columns"""
-    print("Creating indexes for better query performance...")
-    
-    indexes = [
-        "CREATE INDEX IF NOT EXISTS idx_cytokine_name ON cytokine_effects(cytokine_name);",
-        "CREATE INDEX IF NOT EXISTS idx_cell_type ON cytokine_effects(cell_type);",
-        "CREATE INDEX IF NOT EXISTS idx_species ON cytokine_effects(species);",
-        "CREATE INDEX IF NOT EXISTS idx_experimental_system_type ON cytokine_effects(experimental_system_type);",
-        # Full-text search indexes for text columns
-        "CREATE INDEX IF NOT EXISTS idx_regulated_genes_fts ON cytokine_effects USING gin(to_tsvector('english', COALESCE(regulated_genes, '')));",
-        "CREATE INDEX IF NOT EXISTS idx_regulated_pathways_fts ON cytokine_effects USING gin(to_tsvector('english', COALESCE(regulated_pathways, '')));",
-        "CREATE INDEX IF NOT EXISTS idx_necessary_condition_fts ON cytokine_effects USING gin(to_tsvector('english', COALESCE(necessary_condition, '')));",
-        "CREATE INDEX IF NOT EXISTS idx_cell_process_category_fts ON cytokine_effects USING gin(to_tsvector('english', COALESCE(cell_process_category, '')));",
+    return [
+        item.strip()
+        for item in str(value).split(";")
+        if item.strip()
     ]
-    
+
+
+def clean_value(value):
+    """
+    Handle varying missing values and strip whitespace
+    """
+    if pd.isna(value):
+        return None
+
+    value = str(value).strip()
+
+    if value == "":
+        return None
+
+    missing_values = {
+        "nan",
+        "none",
+        "null",
+        "unknown",
+        "unknown: unknown",
+        "n/a",
+    }
+
+    if value.lower() in missing_values:
+        return None
+
+    return value
+
+
+def clean_dataframe(df):
+    df = df.copy()
+
+    for col in df.columns:
+        df[col] = df[col].apply(clean_value)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Dataframe construction
+# ---------------------------------------------------------------------------
+
+def make_cytokines(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df[["cytokine_name"]]
+        .dropna()
+        .rename(columns={"cytokine_name": "name"})
+        .drop_duplicates()
+        .sort_values("name")
+        .reset_index(drop=True)
+    )
+
+
+def make_cell_types(df: pd.DataFrame) -> pd.DataFrame:
+    return (
+        df[["cell_type"]]
+        .dropna()
+        .rename(columns={"cell_type": "name"})
+        .drop_duplicates()
+        .sort_values("name")
+        .reset_index(drop=True)
+    )
+
+
+def explode_semicolons(series: pd.Series) -> pd.Series:
+    """Vectorized equivalent of applying split_semicolon() to every value."""
+    exploded = series.dropna().str.split(";").explode().str.strip()
+    return exploded[exploded != ""]
+
+
+def make_genes(df: pd.DataFrame) -> pd.DataFrame:
+    symbols = explode_semicolons(df["regulated_genes"])
+
+    return (
+        symbols.rename("symbol")
+        .to_frame()
+        .drop_duplicates()
+        .sort_values("symbol")
+        .reset_index(drop=True)
+    )
+
+
+def make_pathways(df: pd.DataFrame) -> pd.DataFrame:
+    names = explode_semicolons(df["regulated_pathways"])
+
+    if names.empty:
+        return pd.DataFrame(columns=["name"])
+
+    return (
+        names.rename("name")
+        .to_frame()
+        .drop_duplicates()
+        .sort_values("name")
+        .reset_index(drop=True)
+    )
+
+
+def make_cell_processes(df: pd.DataFrame) -> pd.DataFrame:
+    processes = (
+        df[["regulated_cell_processes", "cell_process_category"]]
+        .dropna(subset=["regulated_cell_processes"])
+        .assign(name=lambda x: x["regulated_cell_processes"].str.split(";"))
+        .explode("name")
+        .assign(name=lambda x: x["name"].str.strip())
+        .rename(columns={"cell_process_category": "category"})
+    )
+    processes = processes[processes["name"] != ""]
+
+    if processes.empty:
+        return pd.DataFrame(columns=["name", "category"])
+
+    # cell_processes.name is UNIQUE in the schema, so a process name can only
+    # have one category on record. If the raw data assigns the same process
+    # name to multiple categories, keep the first one seen (deterministic
+    # because of the sort below) rather than trying to store both.
+    return (
+        processes[["name", "category"]]
+        .drop_duplicates()
+        .sort_values(["name", "category"], na_position="last")
+        .drop_duplicates(subset=["name"], keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def make_sources(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build the source table. Note that mapped_citation_id is heterogenous; 
+    can be DOI or PMID
+    """
+    sources = (
+        df[
+            ["source_id", "mapped_citation_id"]
+        ]
+        .drop_duplicates("source_id")
+        .copy()
+    )
+    sources["pmc_id"] = sources["source_id"]
+    sources.rename(columns={"mapped_citation_id": "alt_id"}, inplace=True)
+
+    return sources
+
+
+def make_source_chunks(df: pd.DataFrame) -> pd.DataFrame:
+    chunks = (
+        df[
+            [
+                "chunk_id",
+                "source_id",
+                "key_sentences",
+                "url",
+            ]
+        ]
+        .dropna(subset=["chunk_id", "source_id"])
+        .drop_duplicates("chunk_id")
+        .rename(columns={
+            "key_sentences": "chunk_text",
+        })
+        .reset_index(drop=True)
+    )
+
+    return chunks
+
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+def get_engine() -> Engine:
+    database_url = os.environ.get("DATABASE_URL")
+
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set.\n"
+            "Example:\n"
+            "  export DATABASE_URL="
+            "'postgresql+psycopg://postgres:password@localhost:5432/cytokine_db'"
+        )
+
+    return create_engine(
+        database_url,
+        pool_pre_ping=True,
+    )
+
+
+def test_connection(engine: Engine) -> None:
     with engine.connect() as conn:
-        for idx_sql in indexes:
-            try:
-                conn.execute(text(idx_sql))
-                conn.commit()
-                print(f"✓ Created index")
-            except Exception as e:
-                print(f"⚠ Index creation warning: {e}")
-    
-    print("✓ All indexes created")
+        value = conn.execute(text("SELECT 1")).scalar_one()
 
-def import_csv(csv_file, engine):
-    """Import CSV file into database in chunks."""
-    if not os.path.exists(csv_file):
-        print(f"❌ Error: CSV file '{csv_file}' not found!")
-        sys.exit(1)
+    if value != 1:
+        raise RuntimeError("PostgreSQL connection test failed.")
 
-    print(f"Starting import of {csv_file}...")
-    print(f"Chunk size: {CHUNK_SIZE} rows")
-
-    # Get total rows for progress bar (source rows, before explode)
-    print("Counting total rows...")
-    total_rows = sum(1 for _ in open(csv_file)) - 1  # Subtract header
-    print(f"Total rows to import: {total_rows:,}")
-
-    chunk_iterator = pd.read_csv(csv_file, chunksize=CHUNK_SIZE, engine='python')
-    rows_imported = 0
-    with tqdm(total=total_rows, desc="Importing") as pbar:
-        for chunk_num, chunk in enumerate(chunk_iterator, 1):
-            n_read = len(chunk)
-            chunk = prepare_chunk(chunk, explode=True, col_name="cytokine_name")
-            chunk = chunk.fillna('') # replace NaN/None with an empty string
-            if len(chunk):
-                chunk.to_sql(
-                    "cytokine_effects",
-                    engine,
-                    if_exists="append",
-                    index=False,
-                    method="multi",
-                    schema="public",
-                )
-            rows_imported += len(chunk)
-            pbar.update(n_read)
-            if chunk_num % 10 == 0:
-                print(f"  Processed ~{rows_imported:,} rows...")
-    print(f"✓ Import complete! Total rows imported: {rows_imported:,}")
+    print("✓ PostgreSQL connection successful")
 
 
-def import_parquet(parquet_file, engine):
-    """Import Parquet file into database in chunks (row groups / batches)."""
-    if not os.path.exists(parquet_file):
-        print(f"❌ Error: Parquet file '{parquet_file}' not found!")
-        sys.exit(1)
+def clear_existing_data(conn: Connection) -> None:
+    """
+    Clear existing rows without dropping tables.
 
-    print(f"Starting import of {parquet_file}...")
-    print(f"Chunk size: {CHUNK_SIZE} rows")
+    This makes the script a full rebuild of the database contents. Runs on
+    the caller's connection/transaction so a later failure rolls this back
+    along with everything else in the rebuild. Only tables that actually
+    exist in the target database are cleared; anything else in
+    TABLES_TO_CLEAR is skipped rather than raising.
+    """
+    print("Clearing existing database contents...")
 
-    pf = pq.ParquetFile(parquet_file)
-    total_rows = pf.metadata.num_rows
-    print(f"Total rows to import: {total_rows:,}")
+    existing_tables = set(
+        read_table(
+            conn,
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'",
+        )["tablename"]
+    )
 
-    rows_imported = 0
-    with tqdm(total=total_rows, desc="Importing") as pbar:
-        for batch in pf.iter_batches(batch_size=CHUNK_SIZE):
-            n_read = batch.num_rows
-            chunk = batch.to_pandas()
-            chunk = prepare_chunk(chunk)
-            if len(chunk):
-                chunk.to_sql(
-                    "cytokine_effects",
-                    engine,
-                    if_exists="append",
-                    index=False,
-                    method="multi",
-                    schema="public",
-                )
-            rows_imported += len(chunk)
-            pbar.update(n_read)
-    print(f"✓ Import complete! Total rows imported: {rows_imported:,}")
+    for table in TABLES_TO_CLEAR:
+        if table not in existing_tables:
+            print(f"  {table}: does not exist; skipping")
+            continue
 
-def verify_import(engine):
-    """Verify the import was successful"""
-    print("\nVerifying import...")
-    
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT COUNT(*) FROM cytokine_effects"))
-        count = result.scalar()
-        print(f"✓ Total rows in database: {count:,}")
-        
-        # Sample query
-        result = conn.execute(text("SELECT cytokine_name, cell_type, species FROM cytokine_effects LIMIT 5"))
-        print("\nSample data:")
-        for row in result:
-            print(f"  Cytokine: {row[0]}, Cell Type: {row[1]}, Species: {row[2]}")
+        conn.execute(text(f"DELETE FROM {table}"))
 
-def main(args):
-    print("=" * 60)
-    print("Cytokine Knowledgebase - Data Import Tool")
-    print("=" * 60)
-    print()
-    data_file = args.file
-    if not os.path.exists(data_file):
-        print(f"❌ Error: File '{data_file}' does not exist")
-        sys.exit(1)
-    if data_file.lower().endswith(".csv"):
-        import_fn = import_csv
-    elif data_file.lower().endswith(".parquet"):
-        import_fn = import_parquet
+    print("✓ Existing rows deleted")
+
+
+def load_dataframe(
+    df: pd.DataFrame,
+    table_name: str,
+    conn: Connection,
+    chunksize: int = 10_000,
+) -> None:
+    """Append dataframe rows to an existing PostgreSQL table."""
+    if df.empty:
+        print(f"  {table_name}: empty; nothing to load")
+        return
+
+    df.to_sql(
+        table_name,
+        conn,
+        if_exists="append",
+        index=False,
+        chunksize=chunksize,
+        method="multi",
+    )
+
+    print(f"✓ Loaded {len(df):,} rows into {table_name}")
+
+
+def read_table(conn: Connection, sql: str) -> pd.DataFrame:
+    return pd.read_sql(text(sql), conn)
+
+
+# ---------------------------------------------------------------------------
+# Foreign-key mapping
+# ---------------------------------------------------------------------------
+
+def add_cytokine_ids(
+    interactions: pd.DataFrame,
+    conn: Connection,
+) -> pd.DataFrame:
+    lookup = read_table(
+        conn,
+        """
+        SELECT cytokine_id, name
+        FROM cytokines
+        """
+    )
+
+    interactions = interactions.merge(
+        lookup,
+        left_on="cytokine_name",
+        right_on="name",
+        how="left",
+        validate="many_to_one",
+    )
+
+    missing = interactions["cytokine_id"].isna()
+    if missing.any():
+        values = interactions.loc[missing, "cytokine_name"].drop_duplicates().tolist()
+        raise ValueError(
+            f"Could not map {missing.sum()} interaction rows to cytokines. "
+            f"Missing values include: {values[:10]}"
+        )
+
+    interactions = interactions.drop(columns=["name"])
+
+    return interactions
+
+
+def add_cell_type_ids(
+    interactions: pd.DataFrame,
+    conn: Connection,
+) -> pd.DataFrame:
+    lookup = read_table(
+        conn,
+        """
+        SELECT cell_type_id, name
+        FROM cell_types
+        """
+    )
+
+    interactions = interactions.merge(
+        lookup,
+        left_on="cell_type",
+        right_on="name",
+        how="left",
+        validate="many_to_one",
+    )
+
+    missing = interactions["cell_type_id"].isna()
+    if missing.any():
+        values = interactions.loc[missing, "cell_type"].drop_duplicates().tolist()
+        raise ValueError(
+            f"Could not map {missing.sum()} interaction rows to cell types. "
+            f"Missing values include: {values[:10]}"
+        )
+
+    interactions = interactions.drop(columns=["name"])
+
+    return interactions
+
+
+def add_interaction_ids(
+    interactions: pd.DataFrame,
+    conn: Connection,
+) -> pd.DataFrame:
+    """
+    Retrieve PostgreSQL-generated interaction_id values.
+
+    raw_row_id uniquely identifies each source dataframe row, so this creates
+    an unambiguous mapping from the raw extraction to PostgreSQL.
+    """
+    lookup = read_table(
+        conn,
+        """
+        SELECT interaction_id, raw_row_id
+        FROM interactions
+        """
+    )
+
+    interactions = interactions.merge(
+        lookup,
+        on="raw_row_id",
+        how="left",
+        validate="one_to_one",
+    )
+
+    missing = interactions["interaction_id"].isna()
+    if missing.any():
+        raise ValueError(
+            f"{missing.sum()} interactions did not receive an interaction_id."
+        )
+
+    interactions["interaction_id"] = (
+        interactions["interaction_id"].astype("int64")
+    )
+
+    return interactions
+
+
+# ---------------------------------------------------------------------------
+# Junction-table construction
+# ---------------------------------------------------------------------------
+
+def make_interaction_genes(
+    df: pd.DataFrame,
+    interactions: pd.DataFrame,
+    conn: Connection,
+) -> pd.DataFrame:
+
+    interaction_id_by_raw_row = (
+        interactions.set_index("raw_row_id")["interaction_id"]
+    )
+
+    links = (
+        df[["raw_row_id", "regulated_genes", "gene_response_type"]]
+        .dropna(subset=["regulated_genes"])
+        .assign(symbol=lambda x: x["regulated_genes"].str.split(";"))
+        .explode("symbol")
+        .assign(symbol=lambda x: x["symbol"].str.strip())
+        .rename(columns={"gene_response_type": "response_type"})
+    )
+    links = links[links["symbol"] != ""]
+    links["interaction_id"] = links["raw_row_id"].map(interaction_id_by_raw_row)
+
+    if links.empty:
+        return pd.DataFrame(
+            columns=["interaction_id", "gene_id", "response_type"]
+        )
+
+    links = links[["interaction_id", "symbol", "response_type"]].drop_duplicates(
+        subset=["interaction_id", "symbol"]
+    )
+
+    gene_lookup = read_table(
+        conn,
+        """
+        SELECT gene_id, symbol
+        FROM genes
+        """
+    )
+
+    links = links.merge(
+        gene_lookup,
+        on="symbol",
+        how="left",
+        validate="many_to_one",
+    )
+
+    missing = links["gene_id"].isna()
+    if missing.any():
+        bad = links.loc[
+            missing,
+            ["symbol"]
+        ].drop_duplicates()
+
+        raise ValueError(
+            "Could not map genes to gene IDs:\n"
+            f"{bad.head(20).to_string(index=False)}"
+        )
+
+    return (
+        links[
+            [
+                "interaction_id",
+                "gene_id",
+                "response_type",
+            ]
+        ]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+
+def make_interaction_pathways(
+    df: pd.DataFrame,
+    interactions: pd.DataFrame,
+    conn: Connection,
+) -> pd.DataFrame:
+
+    interaction_id_by_raw_row = (
+        interactions.set_index("raw_row_id")["interaction_id"]
+    )
+
+    links = (
+        df[["raw_row_id", "regulated_pathways", "pathway_response_type"]]
+        .dropna(subset=["regulated_pathways"])
+        .assign(pathway_name=lambda x: x["regulated_pathways"].str.split(";"))
+        .explode("pathway_name")
+        .assign(pathway_name=lambda x: x["pathway_name"].str.strip())
+        .rename(columns={"pathway_response_type": "response_type"})
+    )
+    links = links[links["pathway_name"] != ""]
+    links["interaction_id"] = links["raw_row_id"].map(interaction_id_by_raw_row)
+
+    if links.empty:
+        return pd.DataFrame(
+            columns=["interaction_id", "pathway_id", "response_type"]
+        )
+
+    links = links[
+        ["interaction_id", "pathway_name", "response_type"]
+    ].drop_duplicates(subset=["interaction_id", "pathway_name"])
+
+    pathway_lookup = read_table(
+        conn,
+        """
+        SELECT pathway_id, name
+        FROM pathways
+        """
+    )
+
+    links = links.merge(
+        pathway_lookup,
+        left_on="pathway_name",
+        right_on="name",
+        how="left",
+        validate="many_to_one",
+    )
+
+    missing = links["pathway_id"].isna()
+    if missing.any():
+        bad = links.loc[
+            missing,
+            ["pathway_name"]
+        ].drop_duplicates()
+
+        raise ValueError(
+            "Could not map pathways to pathway IDs:\n"
+            f"{bad.head(20).to_string(index=False)}"
+        )
+
+    return (
+        links[
+            [
+                "interaction_id",
+                "pathway_id",
+                "response_type",
+            ]
+        ]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+
+def make_interaction_cell_processes(
+    df: pd.DataFrame,
+    interactions: pd.DataFrame,
+    conn: Connection,
+) -> pd.DataFrame:
+
+    interaction_id_by_raw_row = (
+        interactions.set_index("raw_row_id")["interaction_id"]
+    )
+
+    links = (
+        df[
+            [
+                "raw_row_id",
+                "regulated_cell_processes",
+                "cell_process_category",
+                "cell_process_response_type",
+            ]
+        ]
+        .dropna(subset=["regulated_cell_processes"])
+        .assign(
+            process_name=lambda x: x["regulated_cell_processes"].str.split(";")
+        )
+        .explode("process_name")
+        .assign(process_name=lambda x: x["process_name"].str.strip())
+        .rename(columns={
+            "cell_process_category": "category",
+            "cell_process_response_type": "response_type",
+        })
+    )
+    links = links[links["process_name"] != ""]
+    links["interaction_id"] = links["raw_row_id"].map(interaction_id_by_raw_row)
+
+    if links.empty:
+        return pd.DataFrame(
+            columns=[
+                "interaction_id",
+                "cell_process_id",
+                "response_type",
+            ]
+        )
+
+    links = links[
+        ["interaction_id", "process_name", "category", "response_type"]
+    ].drop_duplicates(subset=["interaction_id", "process_name"])
+
+    process_lookup = read_table(
+        conn,
+        """
+        SELECT cell_process_id, name, category
+        FROM cell_processes
+        """
+    )
+
+    # Usually name is enough. If your database deliberately allows the same
+    # process name with multiple categories, this can be changed to merge on
+    # ["name", "category"].
+    links = links.merge(
+        process_lookup[["cell_process_id", "name"]],
+        left_on="process_name",
+        right_on="name",
+        how="left",
+        validate="many_to_one",
+    )
+
+    missing = links["cell_process_id"].isna()
+    if missing.any():
+        bad = links.loc[
+            missing,
+            ["process_name"]
+        ].drop_duplicates()
+
+        raise ValueError(
+            "Could not map cell processes to cell_process IDs:\n"
+            f"{bad.head(20).to_string(index=False)}"
+        )
+
+    return (
+        links[
+            [
+                "interaction_id",
+                "cell_process_id",
+                "response_type",
+            ]
+        ]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+def validate_database(
+    conn: Connection,
+    raw_df: pd.DataFrame,
+) -> None:
+
+    print("\nDatabase validation")
+    print("-------------------")
+
+    tables = [
+        "cytokines",
+        "cell_types",
+        "genes",
+        "pathways",
+        "cell_processes",
+        "sources",
+        "source_chunks",
+        "interactions",
+        "interaction_genes",
+        "interaction_pathways",
+        "interaction_cell_processes",
+    ]
+
+    counts = {}
+
+    for table in tables:
+        result = read_table(
+            conn,
+            f"SELECT COUNT(*) AS n FROM {table}"
+        )
+
+        counts[table] = int(result["n"].iloc[0])
+        print(f"{table:35s} {counts[table]:,}")
+
+    # Every raw dataframe row should become exactly one interaction.
+    if counts["interactions"] != len(raw_df):
+        raise AssertionError(
+            "Interaction count does not equal raw dataframe row count: "
+            f"{counts['interactions']:,} != {len(raw_df):,}"
+        )
+
+    # Check foreign-key relationships aren't dangling.
+    checks = {
+        "interaction cytokines": """
+            SELECT COUNT(*)
+            FROM interactions i
+            LEFT JOIN cytokines c
+                ON c.cytokine_id = i.cytokine_id
+            WHERE c.cytokine_id IS NULL
+        """,
+        "interaction cell types": """
+            SELECT COUNT(*)
+            FROM interactions i
+            LEFT JOIN cell_types ct
+                ON ct.cell_type_id = i.cell_type_id
+            WHERE ct.cell_type_id IS NULL
+        """,
+        "interaction chunks": """
+            SELECT COUNT(*)
+            FROM interactions i
+            WHERE i.chunk_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM source_chunks sc
+                  WHERE sc.chunk_id = i.chunk_id
+              )
+        """,
+        "gene links": """
+            SELECT COUNT(*)
+            FROM interaction_genes ig
+            LEFT JOIN interactions i
+                ON i.interaction_id = ig.interaction_id
+            LEFT JOIN genes g
+                ON g.gene_id = ig.gene_id
+            WHERE i.interaction_id IS NULL
+               OR g.gene_id IS NULL
+        """,
+        "pathway links": """
+            SELECT COUNT(*)
+            FROM interaction_pathways ip
+            LEFT JOIN interactions i
+                ON i.interaction_id = ip.interaction_id
+            LEFT JOIN pathways p
+                ON p.pathway_id = ip.pathway_id
+            WHERE i.interaction_id IS NULL
+               OR p.pathway_id IS NULL
+        """,
+        "cell-process links": """
+            SELECT COUNT(*)
+            FROM interaction_cell_processes icp
+            LEFT JOIN interactions i
+                ON i.interaction_id = icp.interaction_id
+            LEFT JOIN cell_processes cp
+                ON cp.cell_process_id = icp.cell_process_id
+            WHERE i.interaction_id IS NULL
+               OR cp.cell_process_id IS NULL
+        """,
+    }
+
+    for label, sql in checks.items():
+        n = int(read_table(conn, sql).iloc[0, 0])
+
+        if n != 0:
+            raise AssertionError(
+                f"Validation failed for {label}: {n} invalid rows"
+            )
+
+        print(f"✓ {label}")
+
+    # Useful summary query matching your UI's second page.
+    summary = read_table(
+        conn,
+        """
+        SELECT
+            c.name AS cytokine,
+            ct.name AS cell_type,
+            COUNT(DISTINCT sc.source_id) AS paper_count,
+            COUNT(DISTINCT i.interaction_id) AS interaction_count
+        FROM interactions i
+        JOIN cytokines c
+            ON c.cytokine_id = i.cytokine_id
+        JOIN cell_types ct
+            ON ct.cell_type_id = i.cell_type_id
+        LEFT JOIN source_chunks sc
+            ON sc.chunk_id = i.chunk_id
+        GROUP BY
+            c.cytokine_id,
+            c.name,
+            ct.cell_type_id,
+            ct.name
+        ORDER BY paper_count DESC, interaction_count DESC
+        LIMIT 10
+        """
+    )
+
+    print("\nTop cytokine/cell-type pairs:")
+    if summary.empty:
+        print("  No interactions found.")
     else:
-        print("❌ Error: File must be .csv or .parquet")
+        print(summary.to_string(index=False))
+
+    print("\n✓ Database validation completed successfully")
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def build_database(
+    parquet_path: str,
+    engine: Engine,
+    chunksize: int = 10_000,
+) -> None:
+
+    # -----------------------------------------------------------------------
+    # 1. Read parquet
+    # -----------------------------------------------------------------------
+    print(f"Reading parquet: {parquet_path}")
+
+    df = pd.read_parquet(parquet_path)
+    df.rename(columns={"regulated_pathways_orig": "regulated_pathways_original"}, inplace=True)
+
+    print(f"✓ Read {len(df):,} raw rows")
+    print(f"✓ Found {len(df.columns):,} columns")
+
+    missing_columns = [
+        col for col in REQUIRED_COLUMNS
+        if col not in df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "The parquet is missing required columns:\n"
+            + "\n".join(f"  - {c}" for c in missing_columns)
+        )
+
+    # -----------------------------------------------------------------------
+    # 2. Clean raw dataframe
+    # -----------------------------------------------------------------------
+    print("\nCleaning dataframe...")
+
+    df_clean = clean_dataframe(df)
+
+    # Assigned after cleaning so it stays an int64 column; clean_dataframe()
+    # runs every column through clean_value(), which stringifies values.
+    df_clean["raw_row_id"] = range(len(df_clean))
+
+    print("✓ Cleaning complete")
+
+    # -----------------------------------------------------------------------
+    # 3. Build entity dataframes
+    # -----------------------------------------------------------------------
+    print("\nBuilding normalized dataframes...")
+
+    cache_path = "/Users/molly/.cache/llm_science_reading_data"
+
+    cell_type_index = {}
+
+    with open(os.path.join(cache_path, "CL/cl_inverted_index.json"), "r") as f:
+        cell_type_index.update(json.load(f))
+
+    with open(os.path.join(cache_path, "NCIT/ncit_inverted_index.json"), "r") as f:
+        cell_type_index.update(json.load(f))
+
+    with open(os.path.join(cache_path, "CVCL/cvcl_inverted_index.json"), "r") as f:
+        cell_type_index.update(json.load(f))
+
+    with open(os.path.join(cache_path, "PW/pw_filtered_inverted_index.json"), "r") as f:
+        pathway_index = json.load(f)
+
+    cytokines = make_cytokines(df_clean)
+    cell_types = make_cell_types(df_clean)
+    pathways = make_pathways(df_clean)
+    genes = make_genes(df_clean)
+    cell_processes = make_cell_processes(df_clean)
+    sources = make_sources(df_clean)
+    source_chunks = make_source_chunks(df_clean)
+
+    cell_types["ontology_id"] = cell_types["name"].apply(lambda x: cell_type_index.get(x))
+    pathways["ontology_id"] = pathways["name"].apply(lambda x: pathway_index.get(x))
+    del cell_type_index
+    del pathway_index
+
+    print(f"  cytokines:       {len(cytokines):,}")
+    print(f"  cell types:      {len(cell_types):,}")
+    print(f"  genes:            {len(genes):,}")
+    print(f"  pathways:         {len(pathways):,}")
+    print(f"  cell processes:   {len(cell_processes):,}")
+    print(f"  sources:          {len(sources):,}")
+    print(f"  source chunks:    {len(source_chunks):,}")
+
+    # -----------------------------------------------------------------------
+    # 4-11. Clear, load, and validate — all on one connection/transaction so
+    # any failure rolls back the whole rebuild instead of leaving the
+    # database cleared but only partially reloaded.
+    # -----------------------------------------------------------------------
+    with engine.begin() as conn:
+        # 4. Clear existing database contents
+        clear_existing_data(conn)
+
+        # 5. Load entity/source tables
+        print("\nLoading entity/source tables...")
+
+        load_dataframe(
+            cytokines,
+            "cytokines",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            cell_types,
+            "cell_types",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            genes,
+            "genes",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            pathways,
+            "pathways",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            cell_processes,
+            "cell_processes",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            sources,
+            "sources",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            source_chunks,
+            "source_chunks",
+            conn,
+            chunksize,
+        )
+
+        # 6. Build interaction dataframe and map FK IDs
+        print("\nBuilding interactions...")
+
+        interactions = df_clean.copy()
+
+        interactions = add_cytokine_ids(
+            interactions,
+            conn,
+        )
+
+        interactions = add_cell_type_ids(
+            interactions,
+            conn,
+        )
+
+        # Keep only the columns belonging to PostgreSQL interactions table.
+        interactions_to_load = interactions[INTERACTION_COLUMNS].copy()
+
+        # 7. Load interactions
+        load_dataframe(
+            interactions_to_load,
+            "interactions",
+            conn,
+            chunksize,
+        )
+
+        # 8. Retrieve generated interaction IDs
+        print("\nRetrieving generated interaction IDs...")
+
+        interactions_with_ids = add_interaction_ids(
+            interactions,
+            conn,
+        )
+
+        print(
+            f"✓ Mapped {len(interactions_with_ids):,} "
+            "raw rows to interaction IDs"
+        )
+
+        # 9. Build junction tables
+        print("\nBuilding junction tables...")
+
+        interaction_genes = make_interaction_genes(
+            df_clean,
+            interactions_with_ids,
+            conn,
+        )
+
+        interaction_pathways = make_interaction_pathways(
+            df_clean,
+            interactions_with_ids,
+            conn,
+        )
+
+        interaction_cell_processes = make_interaction_cell_processes(
+            df_clean,
+            interactions_with_ids,
+            conn,
+        )
+
+        print(f"  interaction_genes:          {len(interaction_genes):,}")
+        print(f"  interaction_pathways:       {len(interaction_pathways):,}")
+        print(
+            f"  interaction_cell_processes: "
+            f"{len(interaction_cell_processes):,}"
+        )
+
+        # 10. Load junction tables
+        load_dataframe(
+            interaction_genes,
+            "interaction_genes",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            interaction_pathways,
+            "interaction_pathways",
+            conn,
+            chunksize,
+        )
+
+        load_dataframe(
+            interaction_cell_processes,
+            "interaction_cell_processes",
+            conn,
+            chunksize,
+        )
+
+        # 11. Validate
+        validate_database(
+            conn,
+            df_clean,
+        )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Populate an existing PostgreSQL cytokine database "
+            "from a raw parquet dataframe."
+        )
+    )
+
+    parser.add_argument(
+        "parquet",
+        help="Path to the raw parquet file.",
+    )
+
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10_000,
+        help="Rows per pandas to_sql batch (default: 10000).",
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.parquet):
+        print(
+            f"ERROR: parquet file does not exist: {args.parquet}",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    # Ensure database exists
-    if not DATABASE_URL:
-        print("❌ Error: DATABASE_URL environment variable is not set!")
-        sys.exit(1)
+    engine = get_engine()
+    test_connection(engine)
 
-    print("Checking database connection...")
-    database_url = ensure_database_exists(DATABASE_URL)
-    print()
-
-    # Create engine
     try:
-        engine = create_engine(database_url)
-        # Test connection
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        print(f"✓ Connected to database: {database_url.split('@')[1] if '@' in database_url else 'local'}")
-    except Exception as e:
-        print(f"❌ Error connecting to database: {str(e)[:100]}")
-        sys.exit(1)
-    print()
-
-    # Execute import steps
-    try:
-        # Step 1: Create tables
-        create_tables(engine)
-        print()
-
-        # Step 2: Import data (CSV or Parquet)
-        import_fn(data_file, engine)
-        print()
-
-        # Step 3: Create indexes
-        create_indexes(engine)
-        print()
-
-        # Step 4: Verify
-        verify_import(engine)
-        print()
-
-        print("=" * 60)
-        print("✓ IMPORT COMPLETED SUCCESSFULLY!")
-        print("=" * 60)
-
-    except Exception as e:
-        print(f"\n❌ Error during import: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        build_database(
+            parquet_path=args.parquet,
+            engine=engine,
+            chunksize=args.batch_size,
+        )
+    except Exception:
+        print(
+            "\nERROR: database build failed.",
+            file=sys.stderr,
+        )
+        raise
+    finally:
+        engine.dispose()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Import CSV or Parquet file into PostgreSQL database"
-    )
-    parser.add_argument(
-        "--file",
-        "-f",
-        type=str,
-        required=True,
-        help="Path to the CSV or Parquet file to import",
-    )
-    args = parser.parse_args()
-    main(args)
+    main()
