@@ -22,6 +22,13 @@ assert DATABASE_URL is not None, "please set environment variable DATABASE_URL"
 #     "pool_recycle": 1800,
 # }
 engine = create_engine(DATABASE_URL)
+# engine_kwargs = {
+#     "pool_size": 20,
+#     "max_overflow": 40,
+#     "pool_timeout": 30,
+#     "pool_recycle": 1800,
+# }
+engine = create_engine(DATABASE_URL)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
