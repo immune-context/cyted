@@ -1,115 +1,378 @@
-import argparse
 import os
-import re
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Text, Float, or_
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
-from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-from dotenv import load_dotenv
 from contextlib import contextmanager
+from enum import Enum
+from typing import Any, Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session, sessionmaker
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 assert DATABASE_URL is not None, "please set environment variable DATABASE_URL"
 
-engine_kwargs = {
-    "pool_size": 20,
-    "max_overflow": 40,
-    "pool_timeout": 30,
-    "pool_recycle": 1800,
+# engine_kwargs = {
+#     "pool_size": 20,
+#     "max_overflow": 40,
+#     "pool_timeout": 30,
+#     "pool_recycle": 1800,
+# }
+engine = create_engine(DATABASE_URL)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+SEARCH_FIELDS = [
+    {"key": "cytokine", "label": "Cytokine Name"},
+    {"key": "cell_type", "label": "Cell Type"},
+    {"key": "gene", "label": "Regulated Gene"},
+    {"key": "cell_process", "label": "Cell Process"},
+    {"key": "pathway", "label": "Pathway"},
+    {"key": "source_id", "label": "Source ID"},
+]
+
+ALL_COLUMNS = [
+    "interaction_id",
+    "raw_row_id",
+    "cytokine_name",
+    "cell_type",
+    "cytokine_effect",
+    "regulated_genes",
+    "gene_response_type",
+    "regulated_pathways",
+    "pathway_response_type",
+    "cell_process_category",
+    "regulated_cell_processes",
+    "cell_process_response_type",
+    "chunk_id",
+    "source_id",
+    "key_sentences",
+    "causality_description",
+    "citation_id_classification",
+    "mapped_citation_id",
+    "species",
+    "experimental_system_type",
+    "experimental_system_details",
+    "experimental_perturbation",
+    "experimental_readout",
+    "experimental_time_point",
+    "experimental_concentration",
+    "qc_basic_interaction",
+    "qc_cell_type",
+    "causality_type",
+    "necessary_condition",
+    "additional_info",
+    "cytokine_name_original",
+    "cell_type_original",
+    "cytokine_effect_original",
+    "regulated_pathways_original",
+    "experimental_readout_original",
+    "experimental_perturbation_original",
+    "url",
+]
+
+INTERACTIONS_FROM = """
+FROM interactions i
+JOIN cytokines c
+    ON c.cytokine_id = i.cytokine_id
+JOIN cell_types ct
+    ON ct.cell_type_id = i.cell_type_id
+LEFT JOIN source_chunks sc
+    ON sc.chunk_id = i.chunk_id
+"""
+
+DETAIL_FROM = """
+FROM interactions i
+JOIN cytokines c
+    ON c.cytokine_id = i.cytokine_id
+JOIN cell_types ct
+    ON ct.cell_type_id = i.cell_type_id
+LEFT JOIN source_chunks sc
+    ON sc.chunk_id = i.chunk_id
+LEFT JOIN interaction_genes ig
+    ON ig.interaction_id = i.interaction_id
+LEFT JOIN genes g
+    ON g.gene_id = ig.gene_id
+LEFT JOIN interaction_pathways ip
+    ON ip.interaction_id = i.interaction_id
+LEFT JOIN pathways p
+    ON p.pathway_id = ip.pathway_id
+LEFT JOIN interaction_cell_processes icp
+    ON icp.interaction_id = i.interaction_id
+LEFT JOIN cell_processes cp
+    ON cp.cell_process_id = icp.cell_process_id
+"""
+
+DETAIL_SELECT = """
+SELECT
+    i.interaction_id,
+    i.raw_row_id,
+    c.name AS cytokine_name,
+    ct.name AS cell_type,
+    i.cytokine_effect,
+    STRING_AGG(DISTINCT g.symbol, '; ' ORDER BY g.symbol) AS regulated_genes,
+    i.gene_response_type,
+    STRING_AGG(DISTINCT p.name, '; ' ORDER BY p.name) AS regulated_pathways,
+    i.pathway_response_type,
+    MAX(cp.category) AS cell_process_category,
+    STRING_AGG(DISTINCT cp.name, '; ' ORDER BY cp.name) AS regulated_cell_processes,
+    i.cell_process_response_type,
+    i.chunk_id,
+    sc.source_id,
+    i.key_sentences,
+    i.causality_description,
+    i.citation_id_classification,
+    i.mapped_citation_id,
+    i.species,
+    i.experimental_system_type,
+    i.experimental_system_details,
+    i.experimental_perturbation,
+    i.experimental_readout,
+    i.experimental_time_point,
+    i.experimental_concentration,
+    i.qc_basic_interaction,
+    i.qc_cell_type,
+    i.causality_type,
+    i.necessary_condition,
+    i.additional_info,
+    i.cytokine_name_original,
+    i.cell_type_original,
+    i.cytokine_effect_original,
+    i.regulated_pathways_original,
+    i.experimental_readout_original,
+    i.experimental_perturbation_original,
+    sc.url
+"""
+
+DETAIL_GROUP_BY = """
+GROUP BY
+    i.interaction_id,
+    i.raw_row_id,
+    c.name,
+    ct.name,
+    i.cytokine_effect,
+    i.gene_response_type,
+    i.pathway_response_type,
+    i.cell_process_response_type,
+    i.chunk_id,
+    sc.source_id,
+    i.key_sentences,
+    i.causality_description,
+    i.citation_id_classification,
+    i.mapped_citation_id,
+    i.species,
+    i.experimental_system_type,
+    i.experimental_system_details,
+    i.experimental_perturbation,
+    i.experimental_readout,
+    i.experimental_time_point,
+    i.experimental_concentration,
+    i.qc_basic_interaction,
+    i.qc_cell_type,
+    i.causality_type,
+    i.necessary_condition,
+    i.additional_info,
+    i.cytokine_name_original,
+    i.cell_type_original,
+    i.cytokine_effect_original,
+    i.regulated_pathways_original,
+    i.experimental_readout_original,
+    i.experimental_perturbation_original,
+    sc.url
+"""
+
+# (alias, column, FROM clause reaching interactions i / cytokines c / cell_types ct / source_chunks sc)
+# so that build_filter_sql's WHERE clauses (which reference those aliases) apply unchanged.
+SUGGESTION_FROM: dict[str, tuple[str, str, str]] = {
+    "cytokine": (
+        "c",
+        "name",
+        """
+        FROM cytokines c
+        JOIN interactions i ON i.cytokine_id = c.cytokine_id
+        JOIN cell_types ct ON ct.cell_type_id = i.cell_type_id
+        LEFT JOIN source_chunks sc ON sc.chunk_id = i.chunk_id
+        """,
+    ),
+    "cell_type": (
+        "ct",
+        "name",
+        """
+        FROM cell_types ct
+        JOIN interactions i ON i.cell_type_id = ct.cell_type_id
+        JOIN cytokines c ON c.cytokine_id = i.cytokine_id
+        LEFT JOIN source_chunks sc ON sc.chunk_id = i.chunk_id
+        """,
+    ),
+    "gene": (
+        "g",
+        "symbol",
+        """
+        FROM genes g
+        JOIN interaction_genes ig ON ig.gene_id = g.gene_id
+        JOIN interactions i ON i.interaction_id = ig.interaction_id
+        JOIN cytokines c ON c.cytokine_id = i.cytokine_id
+        JOIN cell_types ct ON ct.cell_type_id = i.cell_type_id
+        LEFT JOIN source_chunks sc ON sc.chunk_id = i.chunk_id
+        """,
+    ),
+    "cell_process": (
+        "cp",
+        "name",
+        """
+        FROM cell_processes cp
+        JOIN interaction_cell_processes icp ON icp.cell_process_id = cp.cell_process_id
+        JOIN interactions i ON i.interaction_id = icp.interaction_id
+        JOIN cytokines c ON c.cytokine_id = i.cytokine_id
+        JOIN cell_types ct ON ct.cell_type_id = i.cell_type_id
+        LEFT JOIN source_chunks sc ON sc.chunk_id = i.chunk_id
+        """,
+    ),
+    "pathway": (
+        "p",
+        "name",
+        """
+        FROM pathways p
+        JOIN interaction_pathways ip ON ip.pathway_id = p.pathway_id
+        JOIN interactions i ON i.interaction_id = ip.interaction_id
+        JOIN cytokines c ON c.cytokine_id = i.cytokine_id
+        JOIN cell_types ct ON ct.cell_type_id = i.cell_type_id
+        LEFT JOIN source_chunks sc ON sc.chunk_id = i.chunk_id
+        """,
+    ),
+    "source_id": (
+        "sc",
+        "source_id",
+        """
+        FROM source_chunks sc
+        JOIN interactions i ON i.chunk_id = sc.chunk_id
+        JOIN cytokines c ON c.cytokine_id = i.cytokine_id
+        JOIN cell_types ct ON ct.cell_type_id = i.cell_type_id
+        """,
+    ),
 }
-engine = create_engine(DATABASE_URL, **engine_kwargs) if "supabase.com" in DATABASE_URL else create_engine(DATABASE_URL)
 
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
 
-Base = declarative_base()
+class SearchField(str, Enum):
+    cytokine = "cytokine"
+    cell_type = "cell_type"
+    gene = "gene"
+    cell_process = "cell_process"
+    pathway = "pathway"
+    source_id = "source_id"
 
-ALL_COLUMNS = ['id', 'cytokine_name', 'cell_type', 'cytokine_effect', 'regulated_genes',
-       'gene_response_type', 'regulated_pathways', 'pathway_response_type',
-       'cell_process_category', 'regulated_cell_processes',
-       'cell_process_response_type', 'chunk_id', 'source_id', 'key_sentences',
-       'causality_description', 'citation_id_classification',
-       'mapped_citation_id', 'species', 'experimental_system_type',
-       'experimental_system_details', 'experimental_perturbation',
-       'experimental_readout', 'experimental_time_point',
-       'experimental_concentration', 'qc_basic_interaction', 'qc_cell_type',
-       'regulated_genes_human', 'regulated_genes_mouse', 'causality_type',
-       'necessary_condition', 'additional_info', 'cytokine_name_original',
-       'cell_type_original', 'cytokine_effect_original',
-       'experimental_readout_original',
-       'experimental_perturbation_original', 'url']
 
-# Database Model (columns must match ALL_COLUMNS)
-class CytokineInteraction(Base):
-    __tablename__ = "cytokine_effects"
+class SearchFilters(BaseModel):
+    cytokine: list[str] = Field(default_factory=list)
+    cell_type: list[str] = Field(default_factory=list)
+    gene: list[str] = Field(default_factory=list)
+    cell_process: list[str] = Field(default_factory=list)
+    pathway: list[str] = Field(default_factory=list)
+    source_id: list[str] = Field(default_factory=list)
 
-    id = Column(Integer, primary_key=True, index=True)
-    cytokine_name = Column(String(200), index=True)
-    cell_type = Column(String(500), index=True)
-    cytokine_effect = Column(String(500))
-    regulated_genes = Column(Text)
-    gene_response_type = Column(String(200))
-    regulated_pathways = Column(Text)
-    pathway_response_type = Column(String(200))
-    cell_process_category = Column(String(200))
-    regulated_cell_processes = Column(Text)
-    cell_process_response_type = Column(String(200))
-    chunk_id = Column(String(200))
-    source_id = Column(String(200))
-    key_sentences = Column(Text)
-    causality_description = Column(Text)
-    citation_id_classification = Column(String(200))
-    mapped_citation_id = Column(String(200))
-    species = Column(String(200), index=True)
-    experimental_system_type = Column(String(200))
-    experimental_system_details = Column(Text)
-    experimental_perturbation = Column(String(500))
-    experimental_readout = Column(String(500))
-    experimental_time_point = Column(String(200))
-    experimental_concentration = Column(String(200))
-    qc_basic_interaction = Column(String(200))
-    qc_cell_type = Column(String(200))
-    regulated_genes_human = Column(Text)
-    regulated_genes_mouse = Column(Text)
-    causality_type = Column(String(200))
-    necessary_condition = Column(String(500))
-    additional_info = Column(Text)
-    cytokine_name_original = Column(String(500))
-    cell_type_original = Column(String(500))
-    cytokine_effect_original = Column(String(500))
-    experimental_readout_original = Column(String(500))
-    experimental_perturbation_original = Column(String(500))
-    url = Column(String(500))
+    def is_empty(self) -> bool:
+        return not any(
+            [
+                self.cytokine,
+                self.cell_type,
+                self.gene,
+                self.cell_process,
+                self.pathway,
+                self.source_id,
+            ]
+        )
 
-# Pydantic models
-class InteractionResponse(BaseModel):
-    id: int
-    data: Dict[str, Any]
-    
-    class Config:
-        from_attributes = True
+    def as_dict(self) -> dict[str, list[str]]:
+        return {
+            "cytokine": self.cytokine,
+            "cell_type": self.cell_type,
+            "gene": self.gene,
+            "cell_process": self.cell_process,
+            "pathway": self.pathway,
+            "source_id": self.source_id,
+        }
 
-class PaginatedResponse(BaseModel):
-    data: List[Dict[str, Any]]
-    pagination: Dict[str, Any]
-    filters: Dict[str, Any]
 
-class FilterOptions(BaseModel):
-    column: str
-    values: List[str]
+class SummaryGroup(BaseModel):
+    cytokine_id: int
+    cytokine_name: str
+    cell_type_id: int
+    cell_type: str
+    paper_count: int
+    interaction_count: int
 
-# FastAPI app
+
+class SummaryResponse(BaseModel):
+    filters: dict[str, list[str]]
+    groups: list[SummaryGroup]
+    total_groups: int
+
+
+class SuggestionsResponse(BaseModel):
+    field: str
+    values: list[str]
+
+
+class SuggestionsPageResponse(BaseModel):
+    field: str
+    values: list[str]
+    pagination: dict[str, int]
+
+
+class PaginatedInteractionsResponse(BaseModel):
+    data: list[dict[str, Any]]
+    pagination: dict[str, int]
+    filters: dict[str, list[str]]
+    cytokine_id: int
+    cell_type_id: int
+
+
+def build_suggestion_where(
+    field: str, filters: SearchFilters, q: str = ""
+) -> tuple[str, str, str, str, dict[str, Any]]:
+    alias, column, from_sql = SUGGESTION_FROM[field]
+
+    # Exclude the field's own filter so its suggestions still expand across
+    # values compatible with everything else selected (multi-select support).
+    other_filters = SearchFilters(**{**filters.as_dict(), field: []})
+    where_sql, params = build_filter_sql(other_filters)
+
+    q = q.strip()
+    if q:
+        pattern_clause = f"{alias}.{column} ILIKE :pattern"
+        where_sql = (
+            f"{where_sql} AND {pattern_clause}"
+            if where_sql
+            else f"WHERE {pattern_clause}"
+        )
+        params["pattern"] = f"%{q}%"
+
+    return alias, column, from_sql, where_sql, params
+
+
+def build_suggestion_sql(
+    field: str, filters: SearchFilters, q: str
+) -> tuple[str, dict[str, Any]]:
+    alias, column, from_sql, where_sql, params = build_suggestion_where(field, filters, q)
+
+    sql = f"""
+        SELECT value FROM (
+            SELECT DISTINCT {alias}.{column} AS value
+            {from_sql}
+            {where_sql}
+        ) AS distinct_values
+        ORDER BY value NOT ILIKE :prefix_pattern, length(value), value
+        LIMIT :limit
+    """
+    return sql, params
+
+
 app = FastAPI(
     title="Cytokine Knowledgebase API",
-    version="1.0.0"
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -120,6 +383,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 @contextmanager
 def get_db():
     db = SessionLocal()
@@ -129,185 +393,367 @@ def get_db():
         db.close()
 
 
-@app.get("/")
-def root():
-    return {"message": "Cytokine Knowledgebase API", "version": "1.0.0"}
+def parse_list_params(values: Optional[list[str]]) -> list[str]:
+    if not values:
+        return []
 
-@app.get("/api/interactions", response_model=PaginatedResponse)
-def get_interactions(
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=500),
-    fields: Optional[str] = None,
-    cytokine_name: Optional[str] = None,
-    cell_type: Optional[str] = None,
-    species: Optional[str] = None,
-    regulated_genes: Optional[str] = None,
-    causality_type: Optional[str] = None,
-    experimental_system_type: Optional[str] = None,
-    regulated_pathways: Optional[str] = None,
-    cell_process_category: Optional[str] = None,
-    cytokine_effect: Optional[str] = None,
-    necessary_condition: Optional[str] = None,
-    experimental_readout: Optional[str] = None,
-):
-    with get_db() as db:
-        query = db.query(CytokineInteraction)
-        filters = {}
+    parsed: list[str] = []
+    for value in values:
+        parsed.extend(part.strip() for part in value.split(",") if part.strip())
+    return parsed
 
-        if cytokine_name:
-            query = query.filter(CytokineInteraction.cytokine_name.ilike(f"%{cytokine_name}%"))
-            filters["cytokine_name"] = cytokine_name
-        if cell_type:
-            query = query.filter(CytokineInteraction.cell_type.ilike(f"%{cell_type}%"))
-            filters["cell_type"] = cell_type
-        if species:
-            query = query.filter(CytokineInteraction.species.ilike(f"%{species}%"))
-            filters["species"] = species
-        if causality_type:
-            query = query.filter(CytokineInteraction.causality_type.ilike(f"%{causality_type}%"))
-            filters["causality_type"] = causality_type
-        if experimental_system_type:
-            query = query.filter(CytokineInteraction.experimental_system_type.ilike(f"%{experimental_system_type}%"))
-            filters['experimental_system_type'] = experimental_system_type
-        if regulated_genes:
-            query = query.filter(CytokineInteraction.regulated_genes.ilike(f"%{regulated_genes}%"))
-            filters["regulated_genes"] = regulated_genes
-        if cell_process_category:
-            query = query.filter(CytokineInteraction.cell_process_category.ilike(f"%{cell_process_category}%"))
-            filters["cell_process_category"] = cell_process_category
-        if regulated_pathways:
-            query = query.filter(CytokineInteraction.regulated_pathways.ilike(f"%{regulated_pathways}%"))
-            filters["regulated_pathways"] = regulated_pathways
-        if necessary_condition:
-            query = query.filter(CytokineInteraction.necessary_condition.ilike(f"%{necessary_condition}%"))
-            filters["necessary_condition"] = necessary_condition
-        if experimental_readout:
-            query = query.filter(CytokineInteraction.experimental_readout_original.ilike(f"%{experimental_readout}%"))
-            filters["experimental_readout"] = experimental_readout
-        if cytokine_effect:
-            query = query.filter(CytokineInteraction.cytokine_effect.ilike(f"%{cytokine_effect}%"))
-            filters["cytokine_effect"] = cytokine_effect
 
-        total = query.count()
+def build_search_filters(
+    cytokine: Optional[list[str]] = None,
+    cell_type: Optional[list[str]] = None,
+    gene: Optional[list[str]] = None,
+    cell_process: Optional[list[str]] = None,
+    pathway: Optional[list[str]] = None,
+    source_id: Optional[list[str]] = None,
+) -> SearchFilters:
+    return SearchFilters(
+        cytokine=parse_list_params(cytokine),
+        cell_type=parse_list_params(cell_type),
+        gene=parse_list_params(gene),
+        cell_process=parse_list_params(cell_process),
+        pathway=parse_list_params(pathway),
+        source_id=parse_list_params(source_id),
+    )
 
-        # pagination
-        offset = (page - 1) * limit
-        results = query.offset(offset).limit(limit).all()
 
-        requested_fields = (
-            [f.strip() for f in fields.split(",") if f.strip() in ALL_COLUMNS]
-            if fields else ALL_COLUMNS
+def require_filters(filters: SearchFilters) -> None:
+    if filters.is_empty():
+        raise HTTPException(
+            status_code=400,
+            detail="At least one search filter is required.",
         )
 
-        data = [
-            {field: getattr(row, field) for field in requested_fields}
-            for row in results
-        ]
 
-        return {
-            "data": data,
-            "pagination": {
-                "page": page,
-                "limit": limit,
-                "total": total,
-                "total_pages": (total + limit - 1) // limit
-            },
-            "filters": filters
-        }
+def build_filter_sql(filters: SearchFilters) -> tuple[str, dict[str, Any]]:
+    clauses: list[str] = []
+    params: dict[str, Any] = {}
+
+    if filters.cytokine:
+        clauses.append("c.name = ANY(:cytokines)")
+        params["cytokines"] = filters.cytokine
+
+    if filters.cell_type:
+        clauses.append("ct.name = ANY(:cell_types)")
+        params["cell_types"] = filters.cell_type
+
+    if filters.gene:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM interaction_genes ig
+                JOIN genes g
+                    ON g.gene_id = ig.gene_id
+                WHERE ig.interaction_id = i.interaction_id
+                  AND g.symbol = ANY(:genes)
+            )
+            """
+        )
+        params["genes"] = filters.gene
+
+    if filters.cell_process:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM interaction_cell_processes icp
+                JOIN cell_processes cp
+                    ON cp.cell_process_id = icp.cell_process_id
+                WHERE icp.interaction_id = i.interaction_id
+                  AND cp.name = ANY(:cell_processes)
+            )
+            """
+        )
+        params["cell_processes"] = filters.cell_process
+
+    if filters.pathway:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM interaction_pathways ip
+                JOIN pathways p
+                    ON p.pathway_id = ip.pathway_id
+                WHERE ip.interaction_id = i.interaction_id
+                  AND p.name = ANY(:pathways)
+            )
+            """
+        )
+        params["pathways"] = filters.pathway
+
+    if filters.source_id:
+        clauses.append("sc.source_id = ANY(:source_ids)")
+        params["source_ids"] = filters.source_id
+
+    if not clauses:
+        return "", params
+
+    return "WHERE " + " AND ".join(clauses), params
 
 
-@app.get("/api/filters/{column}")
-def get_filter_options(column: str):
-    """Get unique values for a specific column (for categorical dropdown filters)"""
-    if column not in ALL_COLUMNS:
-        raise HTTPException(status_code=400, detail=f"Invalid column: {column}")
+def row_to_dict(row) -> dict[str, Any]:
+    return dict(row._mapping)
 
-    # TODO: change this within the actual database instead of during the query
-    cleanup_pattern = r' *\[.*?\]'
-    
-    with get_db() as db:
-        col = getattr(CytokineInteraction, column, None)
-        if col is None:
-            raise HTTPException(status_code=400, detail=f"Column not found: {column}")
-        
-        # Get distinct values (some contain multiple items joined by ';' or '+')
-        values = db.query(col).distinct().filter(col.isnot(None)).all()
-        raw_values = [v[0] for v in values if v[0]]
-        # Split on ';' or '+' and collect unique single entries
-        seen = set()
-        for val in raw_values:
-            parts = re.split(r'[;+]', str(val)) if column == "cytokine_name" else str(val).split(';')
-            for part in parts:
-                part = part.strip()
-                part = re.sub(cleanup_pattern, '', part)
-                if part:
-                    seen.add(part)
-        return {"column": column, "values": sorted(seen)}
+
+@app.get("/")
+def root():
+    return {"message": "Cytokine Knowledgebase API", "version": "2.0.0"}
+
+
+@app.get("/api/search-fields")
+def get_search_fields():
+    return {"fields": SEARCH_FIELDS}
+
 
 @app.get("/api/columns")
 def get_columns():
-    """Get all available columns"""
     return {"columns": ALL_COLUMNS}
 
 
-@app.get("/api/interactions/export")
-def export_interactions(
-    fields: Optional[str] = None,
-    limit: int = Query(50000, ge=1, le=100000),
-    cytokine_name: Optional[str] = None,
-    cell_type: Optional[str] = None,
-    species: Optional[str] = None,
-    regulated_genes: Optional[str] = None,
-    causality_type: Optional[str] = None,
-    experimental_system_type: Optional[str] = None,
-    regulated_pathways: Optional[str] = None,
-    cell_process_category: Optional[str] = None,
-    cytokine_effect: Optional[str] = None,
-    necessary_condition: Optional[str] = None,
-    experimental_readout: Optional[str] = None,
+@app.get("/api/suggestions", response_model=SuggestionsResponse)
+def get_suggestions(
+    field: SearchField = Query(...),
+    q: str = Query(..., min_length=1),
+    limit: int = Query(20, ge=1, le=100),
+    cytokine: Optional[list[str]] = Query(None),
+    cell_type: Optional[list[str]] = Query(None),
+    gene: Optional[list[str]] = Query(None),
+    cell_process: Optional[list[str]] = Query(None),
+    pathway: Optional[list[str]] = Query(None),
+    source_id: Optional[list[str]] = Query(None),
 ):
-    """Export filtered results as JSON (for CSV conversion on client)."""
+    filters = build_search_filters(
+        cytokine=cytokine,
+        cell_type=cell_type,
+        gene=gene,
+        cell_process=cell_process,
+        pathway=pathway,
+        source_id=source_id,
+    )
+    sql, params = build_suggestion_sql(field.value, filters, q)
+
+    params.update(
+        {
+            "limit": limit,
+            "prefix_pattern": f"{q.strip()}%",
+        }
+    )
+
     with get_db() as db:
-        query = db.query(CytokineInteraction)
+        rows = db.execute(text(sql), params).all()
 
-        if cytokine_name:
-            query = query.filter(CytokineInteraction.cytokine_name.ilike(f"%{cytokine_name}%"))
-        if cell_type:
-            query = query.filter(CytokineInteraction.cell_type.ilike(f"%{cell_type}%"))
-        if species:
-            query = query.filter(CytokineInteraction.species.ilike(f"%{species}%"))
-        if causality_type:
-            query = query.filter(CytokineInteraction.causality_type.ilike(f"%{causality_type}%"))
-        if experimental_system_type:
-            query = query.filter(CytokineInteraction.experimental_system_type.ilike(f"%{experimental_system_type}%"))
-        if regulated_genes:
-            query = query.filter(CytokineInteraction.regulated_genes.ilike(f"%{regulated_genes}%"))
-        if cell_process_category:
-            query = query.filter(CytokineInteraction.cell_process_category.ilike(f"%{cell_process_category}%"))
-        if regulated_pathways:
-            query = query.filter(CytokineInteraction.regulated_pathways.ilike(f"%{regulated_pathways}%"))
-        if necessary_condition:
-            query = query.filter(CytokineInteraction.necessary_condition.ilike(f"%{necessary_condition}%"))
-        if experimental_readout:
-            query = query.filter(CytokineInteraction.experimental_readout_original.ilike(f"%{experimental_readout}%"))
-        if cytokine_effect:
-            query = query.filter(CytokineInteraction.cytokine_effect.ilike(f"%{cytokine_effect}%"))
+    return {
+        "field": field.value,
+        "values": [row.value for row in rows],
+    }
 
-        results = query.limit(limit).all()
 
-        requested_fields = (
-            [f.strip() for f in fields.split(",") if f.strip() in ALL_COLUMNS]
-            if fields else ALL_COLUMNS
-        )
+@app.get("/api/suggestions/browse", response_model=SuggestionsPageResponse)
+def browse_suggestions(
+    field: SearchField = Query(...),
+    q: str = Query(""),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    cytokine: Optional[list[str]] = Query(None),
+    cell_type: Optional[list[str]] = Query(None),
+    gene: Optional[list[str]] = Query(None),
+    cell_process: Optional[list[str]] = Query(None),
+    pathway: Optional[list[str]] = Query(None),
+    source_id: Optional[list[str]] = Query(None),
+):
+    filters = build_search_filters(
+        cytokine=cytokine,
+        cell_type=cell_type,
+        gene=gene,
+        cell_process=cell_process,
+        pathway=pathway,
+        source_id=source_id,
+    )
+    alias, column, from_sql, where_sql, params = build_suggestion_where(
+        field.value, filters, q
+    )
 
-        data = [
-            {field: getattr(row, field) for field in requested_fields}
-            for row in results
-        ]
+    count_sql = f"""
+        SELECT COUNT(*) AS total FROM (
+            SELECT DISTINCT {alias}.{column} AS value
+            {from_sql}
+            {where_sql}
+        ) AS distinct_values
+    """
 
-        return {"data": data}
+    offset = (page - 1) * limit
+    data_sql = f"""
+        SELECT value FROM (
+            SELECT DISTINCT {alias}.{column} AS value
+            {from_sql}
+            {where_sql}
+        ) AS distinct_values
+        ORDER BY value NOT ILIKE :prefix_pattern, length(value), value
+        LIMIT :limit OFFSET :offset
+    """
+    params["limit"] = limit
+    params["offset"] = offset
+    params["prefix_pattern"] = f"{q.strip()}%"
+
+    with get_db() as db:
+        total = db.execute(text(count_sql), params).scalar_one()
+        rows = db.execute(text(data_sql), params).all()
+
+    total_pages = (total + limit - 1) // limit if total else 0
+
+    return {
+        "field": field.value,
+        "values": [row.value for row in rows],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": total_pages,
+        },
+    }
+
+
+@app.get("/api/summary", response_model=SummaryResponse)
+def get_summary(
+    cytokine: Optional[list[str]] = Query(None),
+    cell_type: Optional[list[str]] = Query(None),
+    gene: Optional[list[str]] = Query(None),
+    cell_process: Optional[list[str]] = Query(None),
+    pathway: Optional[list[str]] = Query(None),
+    source_id: Optional[list[str]] = Query(None),
+):
+    filters = build_search_filters(
+        cytokine=cytokine,
+        cell_type=cell_type,
+        gene=gene,
+        cell_process=cell_process,
+        pathway=pathway,
+        source_id=source_id,
+    )
+    require_filters(filters)
+
+    where_clause, params = build_filter_sql(filters)
+    sql = f"""
+        SELECT
+            c.cytokine_id,
+            c.name AS cytokine_name,
+            ct.cell_type_id,
+            ct.name AS cell_type,
+            COUNT(DISTINCT sc.source_id) AS paper_count,
+            COUNT(DISTINCT i.interaction_id) AS interaction_count
+        {INTERACTIONS_FROM}
+        {where_clause}
+        GROUP BY
+            c.cytokine_id,
+            c.name,
+            ct.cell_type_id,
+            ct.name
+        ORDER BY
+            paper_count DESC,
+            interaction_count DESC,
+            cytokine_name ASC,
+            cell_type ASC
+    """
+
+    with get_db() as db:
+        rows = db.execute(text(sql), params).all()
+
+    groups = [row_to_dict(row) for row in rows]
+    active_filters = {
+        key: value for key, value in filters.as_dict().items() if value
+    }
+
+    return {
+        "filters": active_filters,
+        "groups": groups,
+        "total_groups": len(groups),
+    }
+
+
+@app.get("/api/interactions", response_model=PaginatedInteractionsResponse)
+def get_interactions(
+    cytokine_id: int = Query(...),
+    cell_type_id: int = Query(...),
+    cytokine: Optional[list[str]] = Query(None),
+    cell_type: Optional[list[str]] = Query(None),
+    gene: Optional[list[str]] = Query(None),
+    cell_process: Optional[list[str]] = Query(None),
+    pathway: Optional[list[str]] = Query(None),
+    source_id: Optional[list[str]] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=500),
+):
+    filters = build_search_filters(
+        cytokine=cytokine,
+        cell_type=cell_type,
+        gene=gene,
+        cell_process=cell_process,
+        pathway=pathway,
+        source_id=source_id,
+    )
+    require_filters(filters)
+
+    where_clause, params = build_filter_sql(filters)
+    pair_clause = "i.cytokine_id = :cytokine_id AND i.cell_type_id = :cell_type_id"
+    if where_clause:
+        where_clause = where_clause + f" AND {pair_clause}"
+    else:
+        where_clause = f"WHERE {pair_clause}"
+
+    params["cytokine_id"] = cytokine_id
+    params["cell_type_id"] = cell_type_id
+
+    count_sql = f"""
+        SELECT COUNT(*) AS total
+        FROM (
+            SELECT i.interaction_id
+            {DETAIL_FROM}
+            {where_clause}
+            {DETAIL_GROUP_BY}
+        ) AS grouped_interactions
+    """
+
+    offset = (page - 1) * limit
+    data_sql = f"""
+        {DETAIL_SELECT}
+        {DETAIL_FROM}
+        {where_clause}
+        {DETAIL_GROUP_BY}
+        ORDER BY i.interaction_id ASC
+        LIMIT :limit OFFSET :offset
+    """
+    params["limit"] = limit
+    params["offset"] = offset
+
+    with get_db() as db:
+        total = db.execute(text(count_sql), params).scalar_one()
+        rows = db.execute(text(data_sql), params).all()
+
+    active_filters = {
+        key: value for key, value in filters.as_dict().items() if value
+    }
+    total_pages = (total + limit - 1) // limit if total else 0
+
+    return {
+        "data": [row_to_dict(row) for row in rows],
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": total_pages,
+        },
+        "filters": active_filters,
+        "cytokine_id": cytokine_id,
+        "cell_type_id": cell_type_id,
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)

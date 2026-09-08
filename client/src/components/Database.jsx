@@ -1,425 +1,618 @@
-import React, { useState, useEffect, useCallback } from 'react';
-import { Search as SearchIcon, Filter, Download, ChevronLeft, ChevronRight, X, Settings } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { ChevronLeft, ChevronRight, Search, X } from 'lucide-react';
 
-const API_BASE_URL = import.meta.env.VITE_APP_API_BASE
+const BROWSE_LIMIT = 50;
 
-// Must match ALL_COLUMNS from server/main.py (excluding 'id' for display/selector)
-const ALL_COLUMNS = [
-  'cytokine_name', 'cell_type', 'cytokine_effect', 'regulated_genes',
-  'gene_response_type', 'regulated_pathways', 'pathway_response_type',
-  'cell_process_category', 'regulated_cell_processes',
-  'cell_process_response_type', 'chunk_id', 'source_id', 'key_sentences',
-  'causality_description', 'citation_id_classification',
-  'mapped_citation_id', 'species', 'experimental_system_type',
-  'experimental_system_details', 'experimental_perturbation',
-  'experimental_readout', 'experimental_time_point',
-  'experimental_concentration',
-  'regulated_genes_human', 'regulated_genes_mouse', 'causality_type',
-  'necessary_condition', 'additional_info', 'cytokine_name_original',
-  'cell_type_original', 'cytokine_effect_original',
-  'experimental_readout_original',
-  'experimental_perturbation_original', 'url',
-];
+const API_BASE_URL = import.meta.env.VITE_APP_API_BASE || 'http://localhost:8000';
 
-const DEFAULT_VISIBLE_COLUMNS = [
-  'cytokine_name', 'cell_type', 'cytokine_effect', 'regulated_genes',
-  'gene_response_type', 'regulated_pathways', 'pathway_response_type',
-  'cell_process_category', 'regulated_cell_processes',
-  'cell_process_response_type', 'source_id', 'url',
-  'citation_id_classification', 'mapped_citation_id', 'species',
-  'experimental_system_type', 'experimental_system_details',
-  'experimental_perturbation', 'experimental_readout',
-];
+const SEARCH_FIELD_KEYS = ['cytokine', 'cell_type', 'gene', 'cell_process', 'pathway', 'source_id'];
 
-const FILTERABLE_COLUMNS = [
-  { key: 'cytokine_name', label: 'Cytokine Name' },
-  { key: 'cell_type', label: 'Cell Type' },
-  { key: 'species', label: 'Species' },
-  { key: 'regulated_genes', label: 'Regulated Genes' },
-  { key: 'experimental_system_type', label: 'Experimental System Type' },
-  { key: 'regulated_pathways', label: 'Regulated Pathways' },
-  { key: 'cell_process_category', label: 'Cell Process Category' },
-  { key: 'causality_type', label: 'Causality Type' },
-];
+const EMPTY_FILTERS = Object.fromEntries(SEARCH_FIELD_KEYS.map((key) => [key, []]));
 
-const EXTRA_FILTERABLE_COLUMNS = [
-  { key: 'cytokine_effect', label: 'Cytokine Effect' },
-  { key: 'necessary_condition', label: 'Necessary Condition' },
-  { key: 'experimental_readout', label: 'Experimental Readout' },
-];
+const fetchHeaders = { 'ngrok-skip-browser-warning': '69420' };
 
-const Database = () => {
-  const [data, setData] = useState([]);
-  const [loading, setLoading] = useState(false);
-  const [exportLoading, setExportLoading] = useState(false);
-  const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, total_pages: 0 });
-  const [filters, setFilters] = useState({});
-  const [searchTerm, setSearchTerm] = useState('');
-  const [filterOptions, setFilterOptions] = useState({});
-  const [filterDraft, setFilterDraft] = useState({});
-  const [showFilters, setShowFilters] = useState(true);
-  const [showColumnSelector, setShowColumnSelector] = useState(false);
-  const [visibleColumns, setVisibleColumns] = useState(DEFAULT_VISIBLE_COLUMNS);
+function formatColumnName(col) {
+  return col
+    .split('_')
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(' ')
+    .replace('Id', 'ID')
+    .replace('Url', 'URL');
+}
 
-  const hasAppliedFilters =
-    Object.values(filters).some(Boolean) || (searchTerm && searchTerm.trim().length > 0);
-
-  const formatColumnName = (col) => {
-    return col.split('_').map(word =>
-      word.charAt(0).toUpperCase() + word.slice(1)
-    ).join(' ').replace('Id', 'ID').replace('Url', 'URL');
-  };
-
-  const fetchData = useCallback(async (page = 1) => {
-    setLoading(true);
-    try {
-      const params = new URLSearchParams({
-        page: page.toString(),
-        limit: '50',
-        fields: visibleColumns.join(','),
-      });
-      if (searchTerm) params.append('search', searchTerm);
-      Object.entries(filters).forEach(([key, value]) => {
-        if (value) params.append(key, value);
-      });
-
-      const response = await fetch(
-        `${API_BASE_URL}/api/interactions?${params}`,
-        { headers: new Headers({ 'ngrok-skip-browser-warning': '69420' }) },
-      );
-      const result = await response.json();
-      setData(result.data);
-      setPagination(result.pagination);
-    } catch (error) {
-      console.error('Error fetching data:', error);
-      alert('Error loading data. Make sure the backend server is running.');
-    } finally {
-      setLoading(false);
+function filtersToParams(filters) {
+  const params = new URLSearchParams();
+  for (const key of SEARCH_FIELD_KEYS) {
+    for (const value of filters[key] || []) {
+      params.append(key, value);
     }
-  }, [filters, searchTerm, visibleColumns]);
+  }
+  return params;
+}
+
+function hasFilters(filters) {
+  return SEARCH_FIELD_KEYS.some((key) => (filters[key]?.length ?? 0) > 0);
+}
+
+function truncateText(text, maxLength = 120) {
+  if (text == null || text === '') return '-';
+  const str = String(text);
+  return str.length > maxLength ? `${str.slice(0, maxLength)}...` : str;
+}
+
+function SuggestionBrowserModal({ fieldKey, label, values, onToggleValue, otherFilters, onClose, query = '' }) {
+  const [page, setPage] = useState(1);
+  const [browseValues, setBrowseValues] = useState([]);
+  const [pagination, setPagination] = useState({ page: 1, limit: BROWSE_LIMIT, total: 0, total_pages: 0 });
+  const [loadingBrowse, setLoadingBrowse] = useState(false);
+  const [browseError, setBrowseError] = useState('');
 
   useEffect(() => {
-    if (!hasAppliedFilters) {
-      setData([]);
-      setPagination({ page: 1, limit: 50, total: 0, total_pages: 0 });
-      setLoading(false);
-      return;
-    }
-    fetchData(1);
-  }, [fetchData, hasAppliedFilters]);
-
-  useEffect(() => {
-    if (!hasAppliedFilters) {
-      setShowFilters(true);
-      setShowColumnSelector(false);
-    }
-  }, [hasAppliedFilters]);
-
-  const fetchFilterOptions = useCallback(async (column) => {
-    try {
-      const response = await fetch(
-        `${API_BASE_URL}/api/filters/${column}`,
-        { headers: new Headers({ 'ngrok-skip-browser-warning': '69420' }) },
-      );
-      const result = await response.json();
-      setFilterOptions((prev) => (prev[column] ? prev : { ...prev, [column]: result.values }));
-    } catch (error) {
-      console.error(`Error fetching filter options for ${column}:`, error);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (showFilters) setFilterDraft(filters);
-  }, [showFilters, filters]);
-
-  // Fetch unique values for dropdowns when filter panel opens
-  useEffect(() => {
-    if (!showFilters) return;
-    const cols = FILTERABLE_COLUMNS.map((c) => c.key);
-    cols.forEach((col) => {
-      if (!filterOptions[col]) fetchFilterOptions(col);
-    });
-  }, [showFilters, filterOptions, fetchFilterOptions]);
-
-  const handleFilterSubmit = (e) => {
-    e.preventDefault();
-    setFilters(filterDraft);
-  };
-
-  const clearFilter = (column) => {
-    const newFilters = { ...filters };
-    delete newFilters[column];
-    setFilters(newFilters);
-  };
-
-  const clearAllFilters = () => {
-    setFilters({});
-    setSearchTerm('');
-  };
-
-  const toggleColumn = (column) => {
-    setVisibleColumns(prev =>
-      prev.includes(column)
-        ? prev.filter(c => c !== column)
-        : [...prev, column]
-    );
-  };
-
-  const exportToCSV = async () => {
-    setExportLoading(true);
-    try {
-      const params = new URLSearchParams({
-        fields: visibleColumns.join(','),
-        limit: '50000',
-      });
-      if (searchTerm) params.append('search', searchTerm);
-      Object.entries(filters).forEach(([key, value]) => {
-        if (value) params.append(key, value);
-      });
-
-      const response = await fetch(
-        `${API_BASE_URL}/api/interactions/export?${params}`,
-        { headers: new Headers({ 'ngrok-skip-browser-warning': '69420' }) },
-      );
-      const result = await response.json();
-      const rows = result.data || [];
-
-      if (rows.length === 0) {
-        alert('No data to export. Try adjusting your filters.');
-        return;
+    let cancelled = false;
+    (async () => {
+      setLoadingBrowse(true);
+      setBrowseError('');
+      try {
+        const params = filtersToParams(otherFilters);
+        params.set('field', fieldKey);
+        if (query.trim()) params.set('q', query.trim());
+        params.set('page', String(page));
+        params.set('limit', String(BROWSE_LIMIT));
+        const response = await fetch(`${API_BASE_URL}/api/suggestions/browse?${params}`, {
+          headers: fetchHeaders,
+        });
+        if (!response.ok) throw new Error('Failed to load suggestions');
+        const result = await response.json();
+        if (cancelled) return;
+        setBrowseValues(result.values || []);
+        setPagination(result.pagination || { page: 1, limit: BROWSE_LIMIT, total: 0, total_pages: 0 });
+      } catch (err) {
+        if (!cancelled) {
+          setBrowseValues([]);
+          setBrowseError(err.message || 'Failed to load suggestions');
+        }
+      } finally {
+        if (!cancelled) setLoadingBrowse(false);
       }
+    })();
 
-      const headers = visibleColumns.join(',');
-      const csvRows = rows.map(row =>
-        visibleColumns.map(col => {
-          const val = row[col] ?? '';
-          return `"${String(val).replace(/"/g, '""')}"`;
-        }).join(',')
-      );
-      const csv = [headers, ...csvRows].join('\n');
-      const blob = new Blob([csv], { type: 'text/csv' });
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `cytokine_data_export_${new Date().toISOString().slice(0, 10)}.csv`;
-      a.click();
-      window.URL.revokeObjectURL(url);
-    } catch (error) {
-      console.error('Error exporting:', error);
-      alert('Error exporting data. Please try again.');
-    } finally {
-      setExportLoading(false);
+    return () => {
+      cancelled = true;
+    };
+  }, [fieldKey, query, page, otherFilters]);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg max-h-[80vh] flex flex-col rounded-lg bg-white dark:bg-gray-800 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+          <h3 className="font-semibold text-gray-900 dark:text-gray-100">
+            {query.trim() ? `${label} matching "${query.trim()}"` : `All values: ${label}`}
+          </h3>
+          <button type="button" onClick={onClose} className="text-gray-500 hover:text-gray-700 dark:hover:text-gray-300">
+            <X size={18} />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-4 py-3 space-y-1">
+          {browseError && <p className="text-sm text-red-600 dark:text-red-400">{browseError}</p>}
+          {loadingBrowse && <p className="text-sm text-gray-500">Loading...</p>}
+          {!loadingBrowse && !browseError && browseValues.length === 0 && (
+            <p className="text-sm text-gray-500">No matches</p>
+          )}
+          {!loadingBrowse && browseValues.map((value) => {
+            const selected = values.includes(value);
+            return (
+              <button
+                key={value}
+                type="button"
+                onClick={() => onToggleValue(value)}
+                className={`flex w-full items-center justify-between gap-2 text-left px-3 py-2 text-sm rounded-lg truncate ${
+                  selected
+                    ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200'
+                    : 'hover:bg-gray-100 dark:hover:bg-gray-700'
+                }`}
+                title={value}
+              >
+                <span className="truncate">{value}</span>
+                {selected && <span className="text-xs shrink-0">Selected</span>}
+              </button>
+            );
+          })}
+        </div>
+        {pagination.total_pages > 1 && (
+          <div className="flex items-center justify-between gap-4 text-sm px-4 py-3 border-t border-gray-200 dark:border-gray-700">
+            <span className="text-gray-600 dark:text-gray-400">
+              {((pagination.page - 1) * pagination.limit) + 1}–
+              {Math.min(pagination.page * pagination.limit, pagination.total)} of {pagination.total}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                disabled={pagination.page <= 1 || loadingBrowse}
+                onClick={() => setPage((p) => p - 1)}
+                className="inline-flex items-center gap-1 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-50"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <span>
+                Page {pagination.page} of {pagination.total_pages}
+              </span>
+              <button
+                type="button"
+                disabled={pagination.page >= pagination.total_pages || loadingBrowse}
+                onClick={() => setPage((p) => p + 1)}
+                className="inline-flex items-center gap-1 px-2 py-1 border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-50"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SearchField({ fieldKey, label, values, onChange, otherFilters }) {
+  const [query, setQuery] = useState('');
+  const [suggestions, setSuggestions] = useState([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserQuery, setBrowserQuery] = useState('');
+
+  useEffect(() => {
+    if (!query.trim()) {
+      setSuggestions([]);
+      return undefined;
     }
+
+    const timer = setTimeout(async () => {
+      setLoadingSuggestions(true);
+      try {
+        const params = filtersToParams(otherFilters);
+        params.set('field', fieldKey);
+        params.set('q', query.trim());
+        params.set('limit', '15');
+        const response = await fetch(`${API_BASE_URL}/api/suggestions?${params}`, {
+          headers: fetchHeaders,
+        });
+        if (!response.ok) throw new Error('Failed to load suggestions');
+        const result = await response.json();
+        setSuggestions(result.values.filter((value) => !values.includes(value)));
+      } catch {
+        setSuggestions([]);
+      } finally {
+        setLoadingSuggestions(false);
+      }
+    }, 250);
+
+    return () => clearTimeout(timer);
+  }, [fieldKey, query, values, otherFilters]);
+
+  const addValue = (value) => {
+    if (!values.includes(value)) {
+      onChange([...values, value]);
+    }
+    setQuery('');
+    setSuggestions([]);
   };
 
-  const truncateText = (text, maxLength = 100) => {
-    if (!text || text === 'nan') return '-';
-    const str = String(text);
-    return str.length > maxLength ? str.substring(0, maxLength) + '...' : str;
+  const removeValue = (value) => {
+    onChange(values.filter((item) => item !== value));
   };
 
-  const formatUrlPreview = (url) => {
-    if (!url) return '-';
-    try {
-      const urlObj = new URL(url);
-      const preview = urlObj.hostname + urlObj.pathname;
-      return preview.length > 50 ? preview.substring(0, 50) + '...' : preview;
-    } catch {
-      return url.length > 50 ? url.substring(0, 50) + '...' : url;
+  const toggleValue = (value) => {
+    if (values.includes(value)) {
+      removeValue(value);
+    } else {
+      onChange([...values, value]);
+      setBrowserQuery('');
     }
   };
 
   return (
-    <div className="space-y-4">
-      {/* Action buttons */}
-      {hasAppliedFilters && (
-        <div className="flex flex-wrap gap-3">
-          <button
-            onClick={() => setShowFilters(!showFilters)}
-            className="px-4 py-2 bg-blue-100 hover:bg-gray-300 rounded-lg flex items-center gap-2 transition-colors dark:text-gray-900"
+    <div className="space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">{label}</label>
+        <button
+          type="button"
+          onClick={() => {
+            setBrowserQuery('');
+            setBrowserOpen(true);
+          }}
+          title={`Browse all ${label} values`}
+          className="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-blue-600 dark:text-gray-400 dark:hover:text-blue-400"
+        >
+          <Search size={14} />
+          Browse all
+        </button>
+      </div>
+      <div className="flex flex-wrap gap-2 min-h-[2.25rem] p-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800">
+        {values.map((value) => (
+          <span
+            key={value}
+            className="inline-flex items-center gap-1 px-2 py-1 text-sm rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200"
           >
-            <Filter size={18} />
-            Filters {Object.keys(filters).length > 0 && `(${Object.keys(filters).length})`}
-          </button>
-          <button
-            onClick={() => setShowColumnSelector(!showColumnSelector)}
-            className="px-4 py-2 bg-blue-100 hover:bg-gray-300 rounded-lg flex items-center gap-2 transition-colors dark:text-gray-900"
-          >
-            <Settings size={18} />
-            Columns
-          </button>
-          <button
-            onClick={exportToCSV}
-            disabled={exportLoading}
-            className="px-4 py-2 bg-blue-100 hover:bg-gray-300 rounded-lg flex items-center gap-2 transition-colors dark:text-gray-900 disabled:opacity-60 disabled:cursor-not-allowed"
-          >
-            <Download size={18} />
-            {exportLoading ? 'Exporting...' : 'Export CSV'}
-          </button>
-        </div>
-      )}
-
-      {/* Active filters */}
-      {(Object.keys(filters).length > 0 || searchTerm) && (
-        <div className="flex flex-wrap gap-2 items-center">
-          {searchTerm && (
-            <span className="bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200 px-3 py-1 rounded-full text-sm flex items-center gap-2">
-              Search: {searchTerm}
-              <button onClick={() => setSearchTerm('')} className="hover:text-blue-600">
-                <X size={14} />
-              </button>
-            </span>
+            <span className="max-w-[12rem] truncate" title={value}>{value}</span>
+            <button type="button" onClick={() => removeValue(value)} className="hover:text-blue-600">
+              <X size={14} />
+            </button>
+          </span>
+        ))}
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder={values.length ? 'Add another...' : 'Type to search...'}
+          className="flex-1 min-w-[8rem] bg-transparent outline-none text-sm text-gray-900 dark:text-gray-100"
+        />
+      </div>
+      {query.trim() && (
+        <div className="border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 shadow-sm max-h-40 overflow-y-auto">
+          {loadingSuggestions && (
+            <p className="px-3 py-2 text-sm text-gray-500">Loading...</p>
           )}
-          {Object.entries(filters).map(([key, value]) => (
-            value && (
-              <span key={key} className="bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200 px-3 py-1 rounded-full text-sm flex items-center gap-2">
-                {formatColumnName(key)}: {value}
-                <button onClick={() => clearFilter(key)} className="hover:text-blue-600">
-                  <X size={14} />
-                </button>
-              </span>
-            )
-          ))}
-          {hasAppliedFilters && (
+          {!loadingSuggestions && suggestions.length === 0 && (
+            <p className="px-3 py-2 text-sm text-gray-500">No matches</p>
+          )}
+          {suggestions.map((value) => (
             <button
-              onClick={clearAllFilters}
-              className="text-sm text-red-600 hover:text-red-700 font-medium"
+              key={value}
+              type="button"
+              onClick={() => addValue(value)}
+              className="block w-full text-left px-3 py-2 text-sm hover:bg-gray-100 dark:hover:bg-gray-700 truncate"
+              title={value}
             >
-              Clear All
+              {value}
+            </button>
+          ))}
+          {!loadingSuggestions && (
+            <button
+              type="button"
+              onClick={() => {
+                setBrowserQuery(query.trim());
+                setBrowserOpen(true);
+              }}
+              className="block w-full text-left px-3 py-2 text-sm text-blue-600 dark:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-700 border-t border-gray-200 dark:border-gray-700"
+            >
+              See more...
             </button>
           )}
         </div>
       )}
+      {browserOpen && (
+        <SuggestionBrowserModal
+          fieldKey={fieldKey}
+          label={label}
+          values={values}
+          otherFilters={otherFilters}
+          onToggleValue={toggleValue}
+          onClose={() => setBrowserOpen(false)}
+          query={browserQuery}
+        />
+      )}
+    </div>
+  );
+}
 
-      {/* Filter panel */}
-      {showFilters && (
-        <form
-          onSubmit={handleFilterSubmit}
-          className={`bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700 ${
-            hasAppliedFilters
-              ? 'flex flex-wrap gap-x-6 gap-y-4 p-4'
-              : 'grid grid-cols-2 gap-x-4 gap-y-6 max-w-xl mx-auto w-full min-h-[min(70vh,34rem)] px-6 py-8'
-          }`}
-        >
-          {FILTERABLE_COLUMNS.map(({ key, label }) => (
-            <div key={key} className={hasAppliedFilters ? 'w-fit' : 'min-w-0'}>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{label}</label>
-              <select
-                className={`w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 ${
-                  hasAppliedFilters ? 'min-w-[180px] max-w-[220px]' : 'min-w-0'
-                }`}
-                value={filterDraft[key] ?? ''}
-                onChange={(e) => setFilterDraft(prev => ({ ...prev, [key]: e.target.value || undefined }))}
-              >
-                <option value="">All</option>
-                {(filterOptions[key] ?? []).map((val) => (
-                  <option key={val} value={val}>
-                    {String(val).length > 60 ? `${String(val).slice(0, 57)}...` : val}
-                  </option>
-                ))}
-              </select>
-            </div>
-          ))}
-          {EXTRA_FILTERABLE_COLUMNS.map(({ key, label }) => (
-            <div key={key} className={hasAppliedFilters ? 'w-fit' : 'min-w-0'}>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{label}</label>
-              <input
-                type="text"
-                placeholder="Free text search..."
-                className={`w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 ${
-                  hasAppliedFilters ? 'min-w-[180px] max-w-[220px]' : 'min-w-0'
-                }`}
-                value={filterDraft[key] ?? ''}
-                onChange={(e) => setFilterDraft(prev => ({ ...prev, [key]: e.target.value || undefined }))}
+const Database = () => {
+  const [step, setStep] = useState('search');
+  const [searchFields, setSearchFields] = useState([]);
+  const [columns, setColumns] = useState([]);
+  const [filterDraft, setFilterDraft] = useState(EMPTY_FILTERS);
+  const [appliedFilters, setAppliedFilters] = useState(EMPTY_FILTERS);
+  const [summaryGroups, setSummaryGroups] = useState([]);
+  const [selectedPair, setSelectedPair] = useState(null);
+  const [detailRows, setDetailRows] = useState([]);
+  const [pagination, setPagination] = useState({ page: 1, limit: 50, total: 0, total_pages: 0 });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    async function loadMeta() {
+      try {
+        const [fieldsRes, columnsRes] = await Promise.all([
+          fetch(`${API_BASE_URL}/api/search-fields`, { headers: fetchHeaders }),
+          fetch(`${API_BASE_URL}/api/columns`, { headers: fetchHeaders }),
+        ]);
+        if (fieldsRes.ok) {
+          const fieldsData = await fieldsRes.json();
+          setSearchFields(fieldsData.fields || []);
+        }
+        if (columnsRes.ok) {
+          const columnsData = await columnsRes.json();
+          setColumns(columnsData.columns || []);
+        }
+      } catch {
+        // Meta endpoints are optional for rendering; search still works with defaults.
+      }
+    }
+    loadMeta();
+  }, []);
+
+  const fieldLabels = searchFields.length
+    ? Object.fromEntries(searchFields.map(({ key, label }) => [key, label]))
+    : {
+        cytokine: 'Cytokine Name',
+        cell_type: 'Cell Type',
+        gene: 'Regulated Gene',
+        cell_process: 'Cell Process',
+        pathway: 'Pathway',
+        source_id: 'Source ID',
+      };
+
+  const fetchSummary = useCallback(async (filters) => {
+    setLoading(true);
+    setError('');
+    try {
+      const params = filtersToParams(filters);
+      const response = await fetch(`${API_BASE_URL}/api/summary?${params}`, {
+        headers: fetchHeaders,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || 'Failed to load summary');
+      }
+      const result = await response.json();
+      setSummaryGroups(result.groups || []);
+      setStep('summary');
+    } catch (err) {
+      setError(err.message || 'Failed to load summary');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fetchDetail = useCallback(async (filters, pair, page = 1) => {
+    setLoading(true);
+    setError('');
+    try {
+      const params = filtersToParams(filters);
+      params.set('cytokine_id', String(pair.cytokine_id));
+      params.set('cell_type_id', String(pair.cell_type_id));
+      params.set('page', String(page));
+      params.set('limit', '50');
+
+      const response = await fetch(`${API_BASE_URL}/api/interactions?${params}`, {
+        headers: fetchHeaders,
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || 'Failed to load interactions');
+      }
+      const result = await response.json();
+      setDetailRows(result.data || []);
+      setPagination(result.pagination || { page: 1, limit: 50, total: 0, total_pages: 0 });
+      setStep('detail');
+    } catch (err) {
+      setError(err.message || 'Failed to load interactions');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const handleSearch = (e) => {
+    e.preventDefault();
+    if (!hasFilters(filterDraft)) {
+      setError('Add at least one search term before searching.');
+      return;
+    }
+    setAppliedFilters(filterDraft);
+    setSelectedPair(null);
+    fetchSummary(filterDraft);
+  };
+
+  const handleSelectPair = (group) => {
+    const pair = {
+      cytokine_id: group.cytokine_id,
+      cell_type_id: group.cell_type_id,
+      cytokine_name: group.cytokine_name,
+      cell_type: group.cell_type,
+    };
+    setSelectedPair(pair);
+    fetchDetail(appliedFilters, pair, 1);
+  };
+
+  const handleBackToSearch = () => {
+    setStep('search');
+    setError('');
+  };
+
+  const handleBackToSummary = () => {
+    setStep('summary');
+    setError('');
+  };
+
+  const updateDraft = (key, values) => {
+    setFilterDraft((prev) => ({ ...prev, [key]: values }));
+  };
+
+  const clearAll = () => {
+    setFilterDraft(EMPTY_FILTERS);
+    setAppliedFilters(EMPTY_FILTERS);
+    setSummaryGroups([]);
+    setSelectedPair(null);
+    setDetailRows([]);
+    setStep('search');
+    setError('');
+  };
+
+  const activeFilterChips = SEARCH_FIELD_KEYS.flatMap((key) =>
+    (appliedFilters[key] || []).map((value) => ({ key, value }))
+  );
+
+  return (
+    <div className="space-y-6 max-w-6xl">
+      <div className="flex flex-wrap items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
+        <span className={step === 'search' ? 'font-semibold text-blue-600 dark:text-blue-400' : ''}>1. Search</span>
+        <span>→</span>
+        <span className={step === 'summary' ? 'font-semibold text-blue-600 dark:text-blue-400' : ''}>2. Summary</span>
+        <span>→</span>
+        <span className={step === 'detail' ? 'font-semibold text-blue-600 dark:text-blue-400' : ''}>3. Details</span>
+      </div>
+
+      {error && (
+        <div className="p-3 rounded-lg bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 text-sm">
+          {error}
+        </div>
+      )}
+
+      {step === 'search' && (
+        <form onSubmit={handleSearch} className="space-y-6">
+          <p className="text-sm text-gray-600 dark:text-gray-400">
+            Add one or more exact-match terms per field. Autocomplete uses substring matching.
+          </p>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            {SEARCH_FIELD_KEYS.map((key) => (
+              <SearchField
+                key={key}
+                fieldKey={key}
+                label={fieldLabels[key] || key}
+                values={filterDraft[key] || []}
+                onChange={(values) => updateDraft(key, values)}
+                otherFilters={filterDraft}
               />
-            </div>
-          ))}
-          <div
-            className={
-              hasAppliedFilters
-                ? 'w-full flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between'
-                : 'col-span-2 flex flex-col gap-3 pt-2'
-            }
-          >
+            ))}
+          </div>
+          <div className="flex flex-wrap gap-3">
             <button
               type="submit"
-              className="px-4 py-2 bg-gray-300 rounded-lg hover:bg-blue-700 focus:ring-2 focus:ring-blue-500 dark:text-gray-800"
+              disabled={loading}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-60"
             >
-              Apply filters
+              <Search size={18} />
+              {loading ? 'Searching...' : 'Search'}
             </button>
-            {!hasAppliedFilters && (
-              <p className="text-sm text-gray-600 dark:text-gray-400">
-                Select at least one filter and click Apply to browse the database.
-              </p>
+            {hasFilters(filterDraft) && (
+              <button
+                type="button"
+                onClick={clearAll}
+                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800"
+              >
+                Clear all
+              </button>
             )}
           </div>
         </form>
       )}
 
-      {/* Column selector */}
-      {hasAppliedFilters && showColumnSelector && (
-        <div className="p-4 bg-gray-50 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700">
-          <h3 className="font-semibold text-gray-900 dark:text-gray-100 mb-3">Select columns to display</h3>
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 max-h-64 overflow-y-auto">
-            {ALL_COLUMNS.map(col => (
-              <label key={col} className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={visibleColumns.includes(col)}
-                  onChange={() => toggleColumn(col)}
-                  className="rounded text-blue-600 focus:ring-blue-500"
-                />
-                {formatColumnName(col)}
-              </label>
-            ))}
-          </div>
+      {step !== 'search' && activeFilterChips.length > 0 && (
+        <div className="flex flex-wrap gap-2 items-center">
+          <span className="text-sm text-gray-600 dark:text-gray-400">Active filters:</span>
+          {activeFilterChips.map(({ key, value }) => (
+            <span
+              key={`${key}-${value}`}
+              className="px-2 py-1 text-sm rounded-full bg-blue-100 dark:bg-blue-900/50 text-blue-800 dark:text-blue-200"
+            >
+              {fieldLabels[key]}: {value}
+            </span>
+          ))}
         </div>
       )}
 
-      {/* Data table */}
-      {hasAppliedFilters && (
-        <div className="bg-white dark:bg-gray-800 shadow-md rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
+      {step === 'summary' && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={handleBackToSearch}
+              className="inline-flex items-center gap-2 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-sm"
+            >
+              <ChevronLeft size={16} />
+              Back to search
+            </button>
+          </div>
+
           {loading ? (
-            <div className="p-12 text-center">
-              <div className="inline-block animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
-              <p className="mt-4 text-gray-600 dark:text-gray-400">Loading data...</p>
+            <p className="text-gray-600 dark:text-gray-400">Loading summary...</p>
+          ) : summaryGroups.length === 0 ? (
+            <p className="text-gray-600 dark:text-gray-400">No results match your search.</p>
+          ) : (
+            <div className="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-100 dark:bg-gray-800">
+                  <tr>
+                    <th className="px-4 py-3 text-left font-semibold">Cytokine</th>
+                    <th className="px-4 py-3 text-left font-semibold">Cell Type</th>
+                    <th className="px-4 py-3 text-right font-semibold">Paper Count</th>
+                    <th className="px-4 py-3 text-right font-semibold">Interactions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                  {summaryGroups.map((group) => (
+                    <tr
+                      key={`${group.cytokine_id}-${group.cell_type_id}`}
+                      onClick={() => handleSelectPair(group)}
+                      className="cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20"
+                    >
+                      <td className="px-4 py-3">{group.cytokine_name}</td>
+                      <td className="px-4 py-3">{group.cell_type}</td>
+                      <td className="px-4 py-3 text-right">{group.paper_count}</td>
+                      <td className="px-4 py-3 text-right">{group.interaction_count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
+          )}
+        </div>
+      )}
+
+      {step === 'detail' && selectedPair && (
+        <div className="space-y-4">
+          <div className="flex flex-wrap gap-3 items-center">
+            <button
+              type="button"
+              onClick={handleBackToSummary}
+              className="inline-flex items-center gap-2 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800 text-sm"
+            >
+              <ChevronLeft size={16} />
+              Back to summary
+            </button>
+            <p className="text-sm text-gray-600 dark:text-gray-400">
+              {selectedPair.cytokine_name} · {selectedPair.cell_type}
+            </p>
+          </div>
+
+          {loading ? (
+            <p className="text-gray-600 dark:text-gray-400">Loading interactions...</p>
           ) : (
             <>
-              <div className="overflow-x-auto">
-                <table className="w-full">
-                  <thead className="bg-gray-100 dark:bg-gray-700">
+              <div className="overflow-x-auto border border-gray-200 dark:border-gray-700 rounded-lg">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-100 dark:bg-gray-800">
                     <tr>
-                      {visibleColumns.map(col => (
+                      {(columns.length ? columns : Object.keys(detailRows[0] || {})).map((col) => (
                         <th
                           key={col}
-                          className="px-4 py-3 text-left text-sm font-semibold text-gray-700 dark:text-gray-300 whitespace-nowrap"
+                          className="px-3 py-2 text-left font-semibold whitespace-nowrap"
                         >
                           {formatColumnName(col)}
                         </th>
                       ))}
                     </tr>
                   </thead>
-                  <tbody className="divide-y divide-gray-200 dark:divide-gray-600">
-                    {data.map((row, idx) => (
-                      <tr key={row.id ?? idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                        {visibleColumns.map(col => (
-                          <td
-                            key={col}
-                            className="px-4 py-3 text-sm text-gray-800 dark:text-gray-200 break-words"
-                          >
+                  <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                    {detailRows.map((row) => (
+                      <tr key={row.interaction_id} className="hover:bg-gray-50 dark:hover:bg-gray-800/50">
+                        {(columns.length ? columns : Object.keys(row)).map((col) => (
+                          <td key={col} className="px-3 py-2 align-top max-w-xs break-words">
                             {col === 'url' && row[col] ? (
                               <a
                                 href={row[col]}
                                 target="_blank"
                                 rel="noopener noreferrer"
-                                className="text-blue-600 hover:text-blue-800 hover:underline"
-                                title={row[col]}
+                                className="text-blue-600 hover:underline"
                               >
-                                {formatUrlPreview(row[col])}
+                                Link
                               </a>
                             ) : (
-                              truncateText(row[col])
+                              truncateText(row[col], 200)
                             )}
                           </td>
                         ))}
@@ -429,35 +622,37 @@ const Database = () => {
                 </table>
               </div>
 
-              {/* Pagination */}
-              <div className="px-4 py-3 bg-gray-50 dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 flex flex-wrap items-center justify-between gap-4">
-                <div className="text-sm text-gray-600 dark:text-gray-400">
-                  Showing {((pagination.page - 1) * pagination.limit) + 1} to{' '}
-                  {Math.min(pagination.page * pagination.limit, pagination.total)} of{' '}
-                  {pagination.total?.toLocaleString() ?? 0} results
-                </div>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => fetchData(pagination.page - 1)}
-                    disabled={pagination.page <= 1}
-                    className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-gray-700 dark:text-gray-300"
-                  >
-                    <ChevronLeft size={16} />
-                    Previous
-                  </button>
-                  <span className="px-4 py-2 text-sm text-gray-600 dark:text-gray-400">
-                    Page {pagination.page} of {pagination.total_pages || 1}
+              {pagination.total_pages > 1 && (
+                <div className="flex flex-wrap items-center justify-between gap-4 text-sm">
+                  <span className="text-gray-600 dark:text-gray-400">
+                    Showing {((pagination.page - 1) * pagination.limit) + 1}–
+                    {Math.min(pagination.page * pagination.limit, pagination.total)} of {pagination.total}
                   </span>
-                  <button
-                    onClick={() => fetchData(pagination.page + 1)}
-                    disabled={pagination.page >= pagination.total_pages}
-                    className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2 text-gray-700 dark:text-gray-300"
-                  >
-                    Next
-                    <ChevronRight size={16} />
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={pagination.page <= 1 || loading}
+                      onClick={() => fetchDetail(appliedFilters, selectedPair, pagination.page - 1)}
+                      className="inline-flex items-center gap-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-50"
+                    >
+                      <ChevronLeft size={16} />
+                      Previous
+                    </button>
+                    <span>
+                      Page {pagination.page} of {pagination.total_pages}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={pagination.page >= pagination.total_pages || loading}
+                      onClick={() => fetchDetail(appliedFilters, selectedPair, pagination.page + 1)}
+                      className="inline-flex items-center gap-1 px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-50"
+                    >
+                      Next
+                      <ChevronRight size={16} />
+                    </button>
+                  </div>
                 </div>
-              </div>
+              )}
             </>
           )}
         </div>
