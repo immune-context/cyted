@@ -8,29 +8,26 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import sessionmaker
 
 load_dotenv()
 
+### PostgreSQL Connection
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+PG_POOL_SIZE = int(os.getenv("PG_POOL_SIZE", '2'))
+PG_MAX_OVERFLOW = int(os.getenv("PG_MAX_OVERFLOW", '0'))
+
 assert DATABASE_URL is not None, "please set environment variable DATABASE_URL"
 
-# engine_kwargs = {
-#     "pool_size": 20,
-#     "max_overflow": 40,
-#     "pool_timeout": 30,
-#     "pool_recycle": 1800,
-# }
-engine = create_engine(DATABASE_URL)
-# engine_kwargs = {
-#     "pool_size": 20,
-#     "max_overflow": 40,
-#     "pool_timeout": 30,
-#     "pool_recycle": 1800,
-# }
-engine = create_engine(DATABASE_URL)
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=PG_POOL_SIZE,
+    max_overflow=PG_MAX_OVERFLOW,
+)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 
 SEARCH_FIELDS = [
     {"key": "cytokine", "label": "Cytokine Name"},
@@ -377,20 +374,6 @@ def build_suggestion_sql(
     return sql, params
 
 
-app = FastAPI(
-    title="Cytokine Knowledgebase API",
-    version="2.0.0",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
 @contextmanager
 def get_db():
     db = SessionLocal()
@@ -505,6 +488,23 @@ def build_filter_sql(filters: SearchFilters) -> tuple[str, dict[str, Any]]:
 
 def row_to_dict(row) -> dict[str, Any]:
     return dict(row._mapping)
+
+
+
+### FastAPI Endpoints
+
+app = FastAPI(
+    title="Cytokine Knowledgebase API",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
